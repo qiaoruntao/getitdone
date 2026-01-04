@@ -50,6 +50,7 @@ pub struct Config {
 - The caller and worker must be created from the same `Config`.
 - Each queue maps to a Mongo collection containing pending tasks plus worker state.
 - Optional knobs let us decide how long a caller waits and how soon a worker can steal in-flight work (including per-task switch delays).
+- Builders can call `reset_finished_tasks(true)` and use `build_with_reset()` to reopen succeeded/failed tasks when an application restarts.
 
 ---
 
@@ -96,6 +97,8 @@ Tasks remain durable in Mongo even if no worker is running yet, so `TaskId` look
 | `idempotency_key` | `String` | Same as `task_id`; unique index per collection. |
 | `request_timeout` | `Option<i64>` | Caller-specific timeout in millis (for reference). |
 | `worker_switch_timeout` | `i64` | Delay before another worker may steal the task. |
+| `trace_context` | `Option<Document>` | Serialized trace/span info. |
+| `reset_finished_to_pending` | `bool` on the builder | When true, `build_with_reset()` reopens completed tasks. |
 | `trace_context` | `Option<Document>` | Serialized trace/span info. |
 | `worker_state` | `Document` | Contains `worker_id`, `started_at`, `heartbeat_at` (periodic ping), `finished_at`, `shutdown_reason`. |
 | `error_reason` | `Option<String>` | Worker-provided failure reason or payload format error. |

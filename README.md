@@ -32,8 +32,10 @@ let config = getitdone::Config::builder()
     .database("getitdone")
     .collection("image_resize")
     .request_timeout(None) // None => allow tasks to run indefinitely
-    .worker_switch_timeout(Duration::from_secs(10)) // default wait before another worker steals a crashed task
-    .build()?;
+    .worker_switch_timeout(Duration::from_secs(10))
+    .reset_finished_tasks(true)
+    .build_with_reset()
+    .await?;
 
 let caller = getitdone::Caller::connect(config.clone()).await?;
 let worker_handle = getitdone::Worker::connect(config).await?.spawn();
@@ -102,6 +104,7 @@ The builder always yields a `Result<TaskOutput, RequestError>`. `Ok` means the w
 - `.with_worker_switch_timeout` controls when another worker may steal the task if the current worker disappears (defaults to the config value).
 - `.with_idempotency_key` deduplicates duplicate submissions.
 - `.with_trace_context` lets you override the captured tracing context (optional).
+- `.reset_finished_tasks(true)` combined with `build_with_reset().await` reopens succeeded/failed tasks when an application restarts.
 - If a worker or caller tries to deserialize a task into the wrong type, the worker will emit `RequestError::PayloadFormat` and mark the task as failed. Each collection must stick to a single pair of Rust types to avoid these errors.
 
 ### Tracing and metadata

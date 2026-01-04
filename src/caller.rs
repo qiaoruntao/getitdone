@@ -211,46 +211,81 @@ async fn insert_task(
     idempotency_key: Option<String>,
     trace_context: Option<String>,
 ) -> Result<String, RequestError> {
-    let task_id = if let Some(key) = &idempotency_key {
-        if caller
-            .collection
-            .find_one(doc! {"task_id": key}, None)
-            .await
-            .map_err(|e| RequestError::Database(e.to_string()))?
-            .is_some()
-        {
-            return Err(RequestError::Duplicate {
-                task_id: key.clone(),
-            });
-        }
-        key.clone()
-    } else {
-        Uuid::new_v4().to_string()
-    };
+    let task_id = idempotency_key.unwrap_or_else(|| Uuid::new_v4().to_string());
 
     let now = DateTime::now();
     let doc = doc! {
         "task_id": &task_id,
-        "task_input": payload,
+        "task_input": payload.clone(),
         "status": "pending",
         "created_at": now,
         "updated_at": now,
         "worker_switch_timeout": worker_switch_timeout.as_millis() as i64,
     };
     let mut doc = doc;
-    if let Some(trace) = trace_context {
+    if let Some(trace) = trace_context.clone() {
         doc.insert("trace_context", trace);
     }
 
     if let Err(e) = caller.collection.insert_one(doc, None).await {
         if let ErrorKind::Write(WriteFailure::WriteError(WriteError { code: 11000, .. })) = *e.kind
         {
+            if caller.config.allow_reset_finished_tasks
+                && try_reset_existing(
+                    caller,
+                    &task_id,
+                    payload,
+                    worker_switch_timeout,
+                    trace_context,
+                )
+                .await?
+            {
+                return Ok(task_id);
+            }
             return Err(RequestError::Duplicate { task_id });
         }
         return Err(RequestError::Database(e.to_string()));
     }
 
     Ok(task_id)
+}
+
+async fn try_reset_existing(
+    caller: &Caller,
+    task_id: &str,
+    payload: Bson,
+    worker_switch_timeout: Duration,
+    trace_context: Option<String>,
+) -> Result<bool, RequestError> {
+    let mut set_fields = doc! {
+        "status": "pending",
+        "task_input": payload,
+        "updated_at": DateTime::now(),
+        "worker_switch_timeout": worker_switch_timeout.as_millis() as i64,
+    };
+    if let Some(trace) = trace_context {
+        set_fields.insert("trace_context", trace);
+    } else {
+        set_fields.insert("trace_context", Bson::Null);
+    }
+    let update = doc! {
+        "$set": set_fields,
+        "$unset": {
+            "task_output": "",
+            "error_reason": "",
+            "worker_state": "",
+        }
+    };
+    let result = caller
+        .collection
+        .update_one(
+            doc! {"task_id": task_id, "status": { "$in": ["succeeded", "failed"] }},
+            update,
+            None,
+        )
+        .await
+        .map_err(|e| RequestError::Database(e.to_string()))?;
+    Ok(result.matched_count > 0)
 }
 
 async fn wait_for_result<TOutput>(
