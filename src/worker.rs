@@ -20,6 +20,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{self, Duration as TokioDuration, MissedTickBehavior};
 use tracing::{error, info, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+use opentelemetry::trace::{SpanContext, TraceId, SpanId, TraceFlags, TraceState};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -362,13 +364,33 @@ where
     );
 
     // Create a handler span to measure business logic duration
-    // The caller_trace_id field links this span to the caller's trace
+    // Use span link to connect this worker trace to the caller's trace
     let handler_span = tracing::info_span!(
         "worker.handler",
         %task_id,
         %worker_id,
-        caller_trace_id = trace_context.as_deref().unwrap_or("none")
     );
+
+    // Add a span link to the caller's trace context if available
+    if let Some(ref caller_trace_id) = trace_context {
+        // Parse the caller's trace_id and create a SpanContext for linking
+        if let Ok(trace_id_bytes) = hex::decode(caller_trace_id) {
+            if trace_id_bytes.len() == 16 {
+                let mut trace_id_arr = [0u8; 16];
+                trace_id_arr.copy_from_slice(&trace_id_bytes);
+                let caller_span_context = SpanContext::new(
+                    TraceId::from_bytes(trace_id_arr),
+                    SpanId::INVALID, // We don't have the original span_id
+                    TraceFlags::SAMPLED,
+                    true, // is_remote
+                    TraceState::default(),
+                );
+                handler_span.add_link(caller_span_context);
+                info!(%task_id, caller_trace_id, "linked worker span to caller trace");
+            }
+        }
+    }
+
     let handler_result = {
         let _guard = handler_span.enter();
         handler(job).await
