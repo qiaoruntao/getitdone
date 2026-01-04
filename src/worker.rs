@@ -360,7 +360,19 @@ where
         worker_switch_timeout,
         hb_stop_rx,
     );
-    let handler_result = handler(job).await;
+
+    // Create a handler span to measure business logic duration
+    // The caller_trace_id field links this span to the caller's trace
+    let handler_span = tracing::info_span!(
+        "worker.handler",
+        %task_id,
+        %worker_id,
+        caller_trace_id = trace_context.as_deref().unwrap_or("none")
+    );
+    let handler_result = {
+        let _guard = handler_span.enter();
+        handler(job).await
+    };
     let _ = hb_stop_tx.send(());
     match handler_result {
         Ok(output) => {
