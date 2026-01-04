@@ -86,6 +86,7 @@ impl Worker {
     }
 }
 
+#[tracing::instrument(skip(collection, stop_rx, handler))]
 async fn worker_loop<TInput, TOutput>(
     collection: Collection<Document>,
     mut stop_rx: oneshot::Receiver<()>,
@@ -172,6 +173,7 @@ async fn worker_loop<TInput, TOutput>(
     }
 }
 
+#[tracing::instrument(skip(collection))]
 async fn claim_next_task(
     collection: &Collection<Document>,
     worker_id: &str,
@@ -231,6 +233,7 @@ async fn open_change_stream(collection: &Collection<Document>) -> Option<ChangeS
     }
 }
 
+#[tracing::instrument(skip(collection, semaphore, handler, join_set))]
 async fn pump_available_tasks<TInput, TOutput>(
     collection: &Collection<Document>,
     worker_id: &str,
@@ -275,6 +278,7 @@ async fn pump_available_tasks<TInput, TOutput>(
     }
 }
 
+#[tracing::instrument(skip(collection, doc, handler, permit), fields(task_id, worker_id, trace_id))]
 async fn process_task<TInput, TOutput>(
     collection: Collection<Document>,
     doc: Document,
@@ -288,6 +292,7 @@ where
     TOutput: Serialize + Send + Sync + 'static,
 {
     let _permit = permit;
+    tracing::Span::current().record("worker_id", &worker_id);
 
     let task_id = match doc
         .get_str("task_id")
@@ -296,6 +301,7 @@ where
         Ok(id) => id.to_string(),
         Err(e) => return Err(e), // Can't mark failed without ID
     };
+    tracing::Span::current().record("task_id", &task_id);
 
     let setup_result: Result<(TInput, Option<String>), RequestError> = async {
         let payload_bson = doc
@@ -315,6 +321,9 @@ where
             }
         })?;
         let trace_context = doc.get_str("trace_context").ok().map(|s| s.to_string());
+        if let Some(ref tid) = trace_context {
+            tracing::Span::current().record("trace_id", tid);
+        }
 
         if !heartbeat(&collection, &task_id, &worker_id).await? {
             error!(%worker_id, %task_id, "lost ownership before handler start");
@@ -337,8 +346,6 @@ where
         }
     };
 
-    let span = tracing::info_span!("worker.process_task", %task_id, %worker_id, trace_id = ?trace_context);
-    let _enter = span.enter();
 
     let job = WorkerJob {
         task_id: task_id.clone(),
@@ -391,6 +398,7 @@ where
     }
 }
 
+#[tracing::instrument(skip(collection))]
 async fn mark_task_failed(collection: &Collection<Document>, task_id: &str, reason: &str) {
     let update = doc! {
         "$set": {
@@ -408,6 +416,7 @@ async fn mark_task_failed(collection: &Collection<Document>, task_id: &str, reas
     }
 }
 
+#[tracing::instrument(skip(collection))]
 async fn heartbeat(
     collection: &Collection<Document>,
     task_id: &str,

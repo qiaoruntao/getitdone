@@ -7,7 +7,7 @@ type SendFuture<T> = Pin<Box<dyn Future<Output = Result<T, RequestError>> + Send
 
 use futures_util::StreamExt;
 use mongodb::Collection;
-use mongodb::bson::{Bson, DateTime, Document, doc, to_bson};
+use mongodb::bson::{Bson, DateTime, Document, doc};
 use mongodb::error::{ErrorKind, WriteError, WriteFailure};
 use mongodb::options::{ChangeStreamOptions, FindOneOptions, FullDocumentType, UpdateOptions};
 use serde::Serialize;
@@ -26,16 +26,19 @@ pub struct Caller {
 }
 
 impl Caller {
+    #[tracing::instrument(skip(config))]
     pub async fn connect(config: Config) -> Result<Self, RequestError> {
         let collection = connect_collection(&config).await?;
         Ok(Caller { config, collection })
     }
 
+    #[tracing::instrument(skip(self, payload), fields(task_id))]
     pub fn send<TInput, TOutput>(&self, payload: TInput) -> SendBuilder<TOutput>
     where
         TInput: Serialize,
         TOutput: DeserializeOwned + Send + Unpin + 'static,
     {
+        use mongodb::bson::to_bson;
         let (payload, payload_err) = match serde_json::to_value(payload) {
             Ok(value) => match to_bson(&value) {
                 Ok(bson) => (Some(bson), None),
@@ -69,6 +72,7 @@ impl Caller {
         }
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn await_response<TOutput>(&self, task_id: String) -> Result<TOutput, RequestError>
     where
         TOutput: DeserializeOwned + Unpin,
@@ -76,6 +80,7 @@ impl Caller {
         wait_for_result::<TOutput>(&self.collection, &task_id).await
     }
 
+    #[tracing::instrument(skip(self, payload))]
     pub async fn dispatch<TInput>(&self, payload: TInput) -> Result<String, RequestError>
     where
         TInput: Serialize,
@@ -123,6 +128,7 @@ where
         self
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn enqueue_only(self) -> Result<String, RequestError> {
         let SendBuilder {
             caller,
@@ -149,6 +155,7 @@ where
         .await
     }
 
+    #[tracing::instrument(skip(self))]
     fn build_future(&mut self) -> Result<SendFuture<TOutput>, RequestError> {
         if let Some(err) = self.payload_err.take() {
             return Err(err);
@@ -205,6 +212,7 @@ where
     }
 }
 
+#[tracing::instrument(skip(caller, payload), fields(task_id))]
 async fn upsert_task(
     caller: &Caller,
     payload: Bson,
@@ -213,6 +221,7 @@ async fn upsert_task(
     trace_context: Option<String>,
 ) -> Result<String, RequestError> {
     let task_id = idempotency_key.unwrap_or_else(|| Uuid::new_v4().to_string());
+    tracing::Span::current().record("task_id", &task_id);
     let now = DateTime::now();
 
     // Build the filter: if reset is allowed, also match finished tasks
