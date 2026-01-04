@@ -15,8 +15,10 @@ bson = "2"
 futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-opentelemetry = { version = "0.24" }
-opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
-tracing-opentelemetry = "0.25"
-opentelemetry-stdout = { version = "0.5" }
-tracing-opentelemetry-instrumentation-sdk = "0.19"
+opentelemetry = { version = "0.31" }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+tracing-opentelemetry = "0.32"
+opentelemetry-stdout = { version = "0.31" }
+tracing-opentelemetry-instrumentation-sdk = "0.32"
+init-tracing-opentelemetry = { version = "0.34", features = ["otlp", "tonic", "metrics", "tracing_subscriber_ext"] }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "logs", "metrics"] }

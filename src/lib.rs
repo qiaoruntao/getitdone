@@ -9,7 +9,19 @@ pub use config::{Config, ConfigBuilder};
 pub use error::RequestError;
 pub use worker::{Worker, WorkerHandle, WorkerJob};
 
-pub fn init_tracing_stdout() -> opentelemetry_sdk::trace::TracerProvider {
+pub fn init_tracing_otlp(service_name: &str, endpoint: &str) -> Result<init_tracing_opentelemetry::Guard, Box<dyn std::error::Error + Send + Sync>> {
+    // Note: set_var is unsafe in recent Rust versions due to potential thread safety issues
+    unsafe {
+        std::env::set_var("OTEL_SERVICE_NAME", service_name);
+        std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint);
+        std::env::set_var("OTEL_EXPORTER_OTLP_PROTOCOL", "grpc");
+    }
+    
+    let config = init_tracing_opentelemetry::TracingConfig::production();
+    config.init_subscriber().map_err(|e| e.into())
+}
+
+pub fn init_tracing_stdout() -> opentelemetry_sdk::trace::SdkTracerProvider {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     use opentelemetry_sdk::propagation::TraceContextPropagator;
@@ -18,7 +30,7 @@ pub fn init_tracing_stdout() -> opentelemetry_sdk::trace::TracerProvider {
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
 
     let exporter = opentelemetry_stdout::SpanExporter::default();
-    let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
         .with_simple_exporter(exporter)
         .build();
     let tracer = provider.tracer("getitdone");
