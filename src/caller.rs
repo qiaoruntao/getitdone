@@ -3,6 +3,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+type SendFuture<T> = Pin<Box<dyn Future<Output = Result<T, RequestError>> + Send>>;
+
 use futures_util::StreamExt;
 use mongodb::Collection;
 use mongodb::bson::{Bson, DateTime, Document, doc, to_bson};
@@ -91,7 +93,7 @@ where
     worker_switch_timeout: Option<Duration>,
     idempotency_key: Option<String>,
     trace_context: Option<String>,
-    future: Option<Pin<Box<dyn Future<Output = Result<TOutput, RequestError>> + Send>>>,
+    future: Option<SendFuture<TOutput>>,
     _marker: std::marker::PhantomData<TOutput>,
 }
 
@@ -145,10 +147,7 @@ where
         .await
     }
 
-    fn build_future(
-        &mut self,
-    ) -> Result<Pin<Box<dyn Future<Output = Result<TOutput, RequestError>> + Send>>, RequestError>
-    {
+    fn build_future(&mut self) -> Result<SendFuture<TOutput>, RequestError> {
         if let Some(err) = self.payload_err.take() {
             return Err(err);
         }
@@ -281,44 +280,6 @@ async fn insert_task(
     }
 }
 
-async fn try_reset_existing(
-    caller: &Caller,
-    task_id: &str,
-    payload: Bson,
-    worker_switch_timeout: Duration,
-    trace_context: Option<String>,
-) -> Result<bool, RequestError> {
-    let mut set_fields = doc! {
-        "status": "pending",
-        "task_input": payload,
-        "updated_at": DateTime::now(),
-        "worker_switch_timeout": worker_switch_timeout.as_millis() as i64,
-    };
-    if let Some(trace) = trace_context {
-        set_fields.insert("trace_context", trace);
-    } else {
-        set_fields.insert("trace_context", Bson::Null);
-    }
-    let update = doc! {
-        "$set": set_fields,
-        "$unset": {
-            "task_output": "",
-            "error_reason": "",
-            "worker_state": "",
-        }
-    };
-    let result = caller
-        .collection
-        .update_one(
-            doc! {"task_id": task_id, "status": { "$in": ["succeeded", "failed"] }},
-            update,
-            None,
-        )
-        .await
-        .map_err(|e| RequestError::Database(e.to_string()))?;
-    Ok(result.matched_count > 0)
-}
-
 async fn wait_for_result<TOutput>(
     collection: &Collection<Document>,
     task_id: &str,
@@ -373,10 +334,10 @@ where
         .map_err(|e| RequestError::Database(e.to_string()))?;
     while let Some(event_result) = stream.next().await {
         let event = event_result.map_err(|e| RequestError::Database(e.to_string()))?;
-        if let Some(full_doc) = event.full_document {
-            if let Some(outcome) = evaluate_document::<TOutput>(&full_doc)? {
-                return outcome;
-            }
+        if let Some(full_doc) = event.full_document
+            && let Some(outcome) = evaluate_document::<TOutput>(&full_doc)?
+        {
+            return outcome;
         }
     }
     Err(RequestError::Database("change stream closed".into()))

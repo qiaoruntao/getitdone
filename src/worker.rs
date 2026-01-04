@@ -2,6 +2,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::future::{BoxFuture, Either, FutureExt};
+
+type WorkerHandler<TInput, TOutput> = Arc<
+    dyn Fn(WorkerJob<TInput>) -> BoxFuture<'static, Result<TOutput, RequestError>> + Send + Sync,
+>;
 use futures_util::stream::StreamExt;
 use mongodb::Collection;
 use mongodb::bson::{Bson, DateTime, Document, doc, to_bson};
@@ -88,11 +92,7 @@ async fn worker_loop<TInput, TOutput>(
     worker_switch_timeout: Duration,
     worker_id: String,
     max_inflight: usize,
-    handler: Arc<
-        dyn Fn(WorkerJob<TInput>) -> BoxFuture<'static, Result<TOutput, RequestError>>
-            + Send
-            + Sync,
-    >,
+    handler: WorkerHandler<TInput, TOutput>,
 ) where
     TInput: DeserializeOwned + Send + 'static,
     TOutput: Serialize + Send + Sync + 'static,
@@ -225,11 +225,7 @@ async fn pump_available_tasks<TInput, TOutput>(
     worker_id: &str,
     worker_switch_timeout: Duration,
     semaphore: &Arc<Semaphore>,
-    handler: &Arc<
-        dyn Fn(WorkerJob<TInput>) -> BoxFuture<'static, Result<TOutput, RequestError>>
-            + Send
-            + Sync,
-    >,
+    handler: &WorkerHandler<TInput, TOutput>,
     join_set: &mut JoinSet<Result<(), RequestError>>,
 ) where
     TInput: DeserializeOwned + Send + 'static,
@@ -272,11 +268,7 @@ async fn process_task<TInput, TOutput>(
     collection: Collection<Document>,
     doc: Document,
     worker_id: String,
-    handler: Arc<
-        dyn Fn(WorkerJob<TInput>) -> BoxFuture<'static, Result<TOutput, RequestError>>
-            + Send
-            + Sync,
-    >,
+    handler: WorkerHandler<TInput, TOutput>,
     permit: OwnedSemaphorePermit,
     worker_switch_timeout: Duration,
 ) -> Result<(), RequestError>

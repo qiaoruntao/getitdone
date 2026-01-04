@@ -25,7 +25,7 @@ This document describes the minimal architecture behind the caller/worker flow. 
 | --- | --- |
 | `TaskInput` | User payload that describes the work. Implements `Serialize + DeserializeOwned + Send + 'static`. |
 | `TaskOutput` | Response payload returned by the worker. Same trait bounds as `TaskInput`. |
-| `TaskId` | Unique identifier assigned to each task so callers can re-fetch/await results later. |
+| `String` | Unique identifier assigned to each task so callers can re-fetch/await results later. |
 | `TraceContext` | Optional trace/span identifiers propagated from caller to worker. |
 | `Config` | MongoDB connection info plus collection name and optional knobs (timeouts, visibility, worker switch delay). |
 | `Caller` | API surface for sending a `TaskInput` and waiting for a `TaskOutput`. |
@@ -42,7 +42,6 @@ pub struct Config {
     pub database: String,
     pub collection: String,
     pub request_timeout: Option<Duration>,
-    pub visibility_timeout: Duration,
     pub worker_switch_timeout: Duration,
 }
 ```
@@ -58,9 +57,9 @@ pub struct Config {
 
 1. **Worker boot** – `Worker::spawn` polls Mongo for `pending` tasks, claims them via `find_one_and_update`, and spawns each job on its own Tokio task while reporting heartbeats.
 2. **Send task** – `caller::send(input)` returns a builder that lets the caller set per-request options (timeout, worker switch timeout, idempotency key, trace override). Calling `.await` on the builder inserts the task document (payload stored as JSON plus metadata such as trace/idempotency key/worker switch timeout) and then waits for change-stream notifications.
-3. **Dispatch only** – `caller::dispatch(input)` is the fire-and-forget variant that writes the document (still storing metadata for later tracing) and immediately returns the assigned `TaskId`.
+3. **Dispatch only** – `caller::dispatch(input)` is the fire-and-forget variant that writes the document (still storing metadata for later tracing) and immediately returns the assigned `task_id` (String).
 4. **Process task** – The worker executes the user code (string length in the prototype), emits periodic heartbeats, and updates the Mongo document only if it still owns the task. Future versions may add retry loops.
-5. **Return value** – Callers awaiting inline rely on Mongo change streams (with a polling fallback) for notification. Callers that only have a `TaskId` can later call `await_response(task_id)` to rehydrate the result, including failure details. If no worker ever claims the task before `visibility_timeout`, the caller receives `RequestError::WorkerTimeout`.
+5. **Return value** – Callers awaiting inline rely on Mongo change streams (with a polling fallback) for notification. Callers that only have a `task_id` can later call `await_response(task_id)` to rehydrate the result, including failure details.
 
 Workers automatically mark their in-flight tasks as failed (with a shutdown reason) before a graceful shutdown. If a worker disappears without updating state, the per-task worker switch timeout ensures the task is unlocked and becomes stealable only after the requested delay.
 
@@ -122,22 +121,22 @@ pub struct Caller {
 
 impl Caller {
     pub async fn connect(config: Config) -> Result<Self, RequestError>;
-    pub fn send(&self, payload: impl Into<String>) -> SendBuilder;
-    pub async fn dispatch(&self, payload: impl Into<String>) -> Result<TaskId, RequestError>;
-    pub async fn await_response(&self, task_id: TaskId) -> Result<usize, RequestError>;
+    pub fn send<TInput, TOutput>(&self, payload: TInput) -> SendBuilder<TOutput>;
+    pub async fn dispatch<TInput>(&self, payload: TInput) -> Result<String, RequestError>;
+    pub async fn await_response<TOutput>(&self, task_id: String) -> Result<TOutput, RequestError>;
 }
 
-pub struct SendBuilder { /* builder storing timeout/idempotency/trace overrides */ }
+pub struct SendBuilder<TOutput> { /* builder storing timeout/idempotency/trace overrides */ }
 
-impl SendBuilder {
+impl<TOutput> SendBuilder<TOutput> {
     pub fn with_timeout(self, timeout: Duration) -> Self;
     pub fn with_worker_switch_timeout(self, timeout: Duration) -> Self;
     pub fn with_idempotency_key(self, key: impl Into<String>) -> Self;
-    pub fn with_trace_context(self, trace: TraceContext) -> Self;
+    pub fn with_trace_context(self, trace: impl Into<String>) -> Self;
 }
 
-impl Future for SendBuilder {
-    type Output = Result<usize, RequestError>;
+impl<TOutput> Future for SendBuilder<TOutput> {
+    type Output = Result<TOutput, RequestError>;
     // stores JSON payload in Mongo, then waits for change-stream events with a polling fallback
 }
 
@@ -165,6 +164,11 @@ impl Worker {
 
 Both roles talk directly to the same Mongo collection; `storage.rs` centralizes the connection code so callers and workers can run in separate binaries.
 
+### Network Compression
+
+The crate supports `zstd`, `snappy`, and `zlib` compression. You can enable them via your MongoDB connection URI if the server supports them.
+Example: `mongodb://localhost:27017/?compressors=zstd`
+
 ---
 
 ### Error handling
@@ -175,7 +179,7 @@ Both roles talk directly to the same Mongo collection; `storage.rs` centralizes 
 - `RequestError::PayloadFormat { field }` – payload could not be serialized/deserialized into the expected JSON for `field` (e.g., incompatible types within the same collection).
 - `RequestError::TaskFailed { reason }` – worker returned a domain error and the result is stored as failure.
 - `RequestError::WorkerGone` – worker crashed or connection closed before writing a response; the task remains pending and becomes stealable after its configured worker switch timeout.
-- `RequestError::WorkerTimeout` – no worker claimed the task before `visibility_timeout` expired or a worker failed to finish within that window.
+- `RequestError::WorkerTimeout` – unused in current implementation (callers rely on their own `request_timeout`).
 - Trace propagation errors are swallowed; if a trace cannot be serialized we fall back to sending the task without trace metadata.
 
 ---
