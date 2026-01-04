@@ -9,7 +9,7 @@ pub use config::{Config, ConfigBuilder};
 pub use error::RequestError;
 pub use worker::{Worker, WorkerHandle, WorkerJob};
 
-pub fn init_tracing_otlp(service_name: &str, endpoint: &str) -> Result<init_tracing_opentelemetry::Guard, Box<dyn std::error::Error + Send + Sync>> {
+pub fn init_tracing_otlp(service_name: &str, endpoint: &str) -> Result<init_tracing_opentelemetry::Guard, Box<dyn std::error::Error>> {
     // Note: set_var is unsafe in recent Rust versions due to potential thread safety issues
     unsafe {
         std::env::set_var("OTEL_SERVICE_NAME", service_name);

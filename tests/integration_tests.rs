@@ -308,7 +308,6 @@ async fn test_reset_finished_tasks() {
 
 #[tokio::test]
 async fn test_tracing_propagation() {
-    let _provider = getitdone::init_tracing_stdout();
     let config = test_config().await;
 
     let worker = Worker::connect(config.clone()).await.unwrap();

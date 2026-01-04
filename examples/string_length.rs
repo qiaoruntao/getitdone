@@ -5,7 +5,7 @@ use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _ = tracing_subscriber::fmt::try_init();
+    let _guard = getitdone::init_tracing_otlp("string-length-example", "http://localhost:4317")?;
     let config = Config::builder()
         .mongo_uri("mongodb://localhost:27017")
         .database("Test")
