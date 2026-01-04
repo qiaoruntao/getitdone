@@ -305,3 +305,29 @@ async fn test_reset_finished_tasks() {
     
     worker_handle.shutdown().await;
 }
+
+#[tokio::test]
+async fn test_tracing_propagation() {
+    let _provider = getitdone::init_tracing_stdout();
+    let config = test_config().await;
+
+    let worker = Worker::connect(config.clone()).await.unwrap();
+    let _handle = worker.run(|job: WorkerJob<EchoInput>| async move {
+        tracing::info!("Worker processing task with trace context: {:?}", job.trace_context);
+        Ok(EchoOutput { msg: job.payload.msg })
+    });
+
+    let caller = Caller::connect(config.clone()).await.unwrap();
+    
+    // Create a span in the caller
+    let span = tracing::info_span!("caller_root_span");
+    let _enter = span.enter();
+
+    let result: EchoOutput = caller
+        .send(EchoInput { msg: "tracing".into() })
+        .await
+        .unwrap();
+
+    assert_eq!(result.msg, "tracing");
+    // Verification is manual via --nocapture output (checking for linked spans)
+}
