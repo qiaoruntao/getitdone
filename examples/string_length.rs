@@ -30,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let worker_handle = match Worker::connect(config).await {
         Ok(worker) => worker.run(|job: WorkerJob<LengthRequest>| async move {
+            info!("Worker processing task with trace_id: {:?}", job.trace_context);
             Ok(LengthResponse {
                 length: job.payload.text.chars().count(),
             })
@@ -39,6 +40,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     };
+
+    // Create a caller span - this becomes the parent span for send operations
+    // The worker's process_task span will have the same trace_id, showing the link
+    let caller_span = tracing::info_span!("caller_operation");
+    let _guard = caller_span.enter();
 
     let request = LengthRequest {
         text: "hello from example".into(),
@@ -55,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(result_length = response.length, "Worker completed task");
 
+    drop(_guard);
     worker_handle.shutdown().await;
     Ok(())
 }
