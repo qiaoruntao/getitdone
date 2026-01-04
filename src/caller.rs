@@ -137,7 +137,7 @@ where
         let payload = payload.ok_or(RequestError::PayloadFormat {
             field: "task_input",
         })?;
-        insert_task(
+        upsert_task(
             &caller,
             payload,
             worker_switch_timeout.unwrap_or(caller.config.worker_switch_timeout),
@@ -163,7 +163,7 @@ where
         let trace_context = self.trace_context.clone();
 
         Ok(Box::pin(async move {
-            let task_id = insert_task(
+            let task_id = upsert_task(
                 &caller,
                 payload,
                 worker_switch_timeout,
@@ -203,7 +203,7 @@ where
     }
 }
 
-async fn insert_task(
+async fn upsert_task(
     caller: &Caller,
     payload: Bson,
     worker_switch_timeout: Duration,

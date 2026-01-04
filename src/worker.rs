@@ -100,6 +100,17 @@ async fn worker_loop<TInput, TOutput>(
     let semaphore = Arc::new(Semaphore::new(max_inflight));
     let mut join_set = JoinSet::new();
     let mut change_stream = open_change_stream(&collection).await;
+    
+    pump_available_tasks(
+        &collection,
+        &worker_id,
+        worker_switch_timeout,
+        &semaphore,
+        &handler,
+        &mut join_set,
+    )
+    .await;
+    
     loop {
         if change_stream.is_none() {
             change_stream = open_change_stream(&collection).await;
@@ -277,30 +288,54 @@ where
     TOutput: Serialize + Send + Sync + 'static,
 {
     let _permit = permit;
-    let task_id = doc
-        .get_str("task_id")
-        .map_err(|_| RequestError::PayloadFormat { field: "task_id" })?
-        .to_string();
-    let payload_bson = doc
-        .get("task_input")
-        .ok_or(RequestError::PayloadFormat {
-            field: "task_input",
-        })?
-        .clone();
-    let payload_value: Value =
-        mongodb::bson::from_bson(payload_bson).map_err(|_| RequestError::PayloadFormat {
-            field: "task_input",
-        })?;
-    let payload: TInput =
-        serde_json::from_value(payload_value).map_err(|_| RequestError::PayloadFormat {
-            field: "task_input",
-        })?;
-    let trace_context = doc.get_str("trace_context").ok().map(|s| s.to_string());
 
-    if !heartbeat(&collection, &task_id, &worker_id).await? {
-        error!(%worker_id, %task_id, "lost ownership before handler start");
-        return Err(RequestError::WorkerGone);
+    let task_id = match doc
+        .get_str("task_id")
+        .map_err(|_| RequestError::PayloadFormat { field: "task_id" })
+    {
+        Ok(id) => id.to_string(),
+        Err(e) => return Err(e), // Can't mark failed without ID
+    };
+
+    let setup_result: Result<(TInput, Option<String>), RequestError> = async {
+        let payload_bson = doc
+            .get("task_input")
+            .ok_or(RequestError::PayloadFormat {
+                field: "task_input",
+            })?
+            .clone();
+        let payload_value: Value = mongodb::bson::from_bson(payload_bson).map_err(|_| {
+            RequestError::PayloadFormat {
+                field: "task_input",
+            }
+        })?;
+        let payload: TInput = serde_json::from_value(payload_value).map_err(|_| {
+            RequestError::PayloadFormat {
+                field: "task_input",
+            }
+        })?;
+        let trace_context = doc.get_str("trace_context").ok().map(|s| s.to_string());
+
+        if !heartbeat(&collection, &task_id, &worker_id).await? {
+            error!(%worker_id, %task_id, "lost ownership before handler start");
+            return Err(RequestError::WorkerGone);
+        }
+        Ok((payload, trace_context))
     }
+    .await;
+
+    let (payload, trace_context) = match setup_result {
+        Ok(v) => v,
+        Err(err) => {
+            mark_task_failed(
+                &collection,
+                &task_id,
+                &format!("infrastructure error: {err}"),
+            )
+            .await;
+            return Err(err);
+        }
+    };
 
     let job = WorkerJob {
         task_id: task_id.clone(),
@@ -403,7 +438,9 @@ fn start_heartbeat_loop(
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = &mut stop_rx => break,
+                _ = &mut stop_rx => {
+                    break;
+                }
                 _ = ticker.tick() => {
                     if let Err(e) = heartbeat(&collection, &task_id, &worker_id).await {
                         error!(%worker_id, %task_id, error=%e, "heartbeat failed");
