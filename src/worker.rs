@@ -1,17 +1,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::future::{BoxFuture, FutureExt};
+use futures_util::future::{BoxFuture, Either, FutureExt};
+use futures_util::stream::StreamExt;
 use mongodb::Collection;
 use mongodb::bson::{Bson, DateTime, Document, doc, to_bson};
-use mongodb::options::{FindOneAndUpdateOptions, ReturnDocument};
+use mongodb::change_stream::ChangeStream;
+use mongodb::options::{
+    ChangeStreamOptions, FindOneAndUpdateOptions, FullDocumentType, ReturnDocument,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{self, Duration as TokioDuration, MissedTickBehavior};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::config::Config;
@@ -95,7 +99,25 @@ async fn worker_loop<TInput, TOutput>(
 {
     let semaphore = Arc::new(Semaphore::new(max_inflight));
     let mut join_set = JoinSet::new();
+    let mut change_stream = open_change_stream(&collection).await;
     loop {
+        if change_stream.is_none() {
+            change_stream = open_change_stream(&collection).await;
+            pump_available_tasks(
+                &collection,
+                &worker_id,
+                worker_switch_timeout,
+                &semaphore,
+                &handler,
+                &mut join_set,
+            )
+            .await;
+            continue;
+        }
+        let change_future = change_stream
+            .as_mut()
+            .map(|stream| Either::Left(stream.next()))
+            .unwrap_or_else(|| Either::Right(futures_util::future::pending()));
         tokio::select! {
             _ = &mut stop_rx => break,
             Some(result) = join_set.join_next(), if !join_set.is_empty() => {
@@ -105,30 +127,25 @@ async fn worker_loop<TInput, TOutput>(
                     Err(e) => error!(error=%e, "worker task panicked"),
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                if let Ok(permit) = semaphore.clone().try_acquire_owned() {
-                    match claim_next_task(&collection, &worker_id, worker_switch_timeout).await {
-                        Ok(Some(task)) => {
-                            let coll = collection.clone();
-                            let worker_id = worker_id.clone();
-                            if let Ok(id) = task.get_str("task_id") {
-                                info!(%worker_id, task_id=%id, "claimed task");
-                            }
-                            let handler = handler.clone();
-                            join_set.spawn(process_task(
-                                coll,
-                                task,
-                                worker_id,
-                                handler,
-                                permit,
-                                worker_switch_timeout,
-                            ));
-                        }
-                        Ok(None) => drop(permit),
-                        Err(e) => {
-                            error!(error=%e, "worker failed to claim task");
-                            drop(permit);
-                        }
+            event = change_future => {
+                match event {
+                    Some(Ok(_)) => {
+                        pump_available_tasks(
+                            &collection,
+                            &worker_id,
+                            worker_switch_timeout,
+                            &semaphore,
+                            &handler,
+                            &mut join_set,
+                        ).await;
+                    }
+                    Some(Err(e)) => {
+                        warn!(error=%e, "change stream error, will restart");
+                        change_stream = None;
+                    }
+                    None => {
+                        warn!("change stream closed, will restart");
+                        change_stream = None;
                     }
                 }
             }
@@ -177,6 +194,78 @@ async fn claim_next_task(
         .find_one_and_update(filter, update, options)
         .await
         .map_err(|e| RequestError::Database(e.to_string()))
+}
+
+async fn open_change_stream(collection: &Collection<Document>) -> Option<ChangeStream<Document>> {
+    let pipeline = vec![doc! {
+        "$match": {
+            "$or": [
+                { "operationType": { "$in": ["insert", "replace"] } },
+                {
+                    "operationType": "update",
+                    "updateDescription.updatedFields.status": "pending"
+                }
+            ]
+        }
+    }];
+    let options = ChangeStreamOptions::builder()
+        .full_document(Some(FullDocumentType::UpdateLookup))
+        .build();
+    match collection.watch(pipeline, Some(options)).await {
+        Ok(stream) => Some(stream.with_type()),
+        Err(e) => {
+            warn!(error=%e, "failed to open change stream");
+            None
+        }
+    }
+}
+
+async fn pump_available_tasks<TInput, TOutput>(
+    collection: &Collection<Document>,
+    worker_id: &str,
+    worker_switch_timeout: Duration,
+    semaphore: &Arc<Semaphore>,
+    handler: &Arc<
+        dyn Fn(WorkerJob<TInput>) -> BoxFuture<'static, Result<TOutput, RequestError>>
+            + Send
+            + Sync,
+    >,
+    join_set: &mut JoinSet<Result<(), RequestError>>,
+) where
+    TInput: DeserializeOwned + Send + 'static,
+    TOutput: Serialize + Send + Sync + 'static,
+{
+    loop {
+        let permit = match semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+        match claim_next_task(collection, worker_id, worker_switch_timeout).await {
+            Ok(Some(task)) => {
+                if let Ok(id) = task.get_str("task_id") {
+                    info!(%worker_id, task_id=%id, "claimed task");
+                }
+                let handler = handler.clone();
+                join_set.spawn(process_task(
+                    collection.clone(),
+                    task,
+                    worker_id.to_string(),
+                    handler,
+                    permit,
+                    worker_switch_timeout,
+                ));
+            }
+            Ok(None) => {
+                drop(permit);
+                break;
+            }
+            Err(e) => {
+                error!(error=%e, "failed to claim task");
+                drop(permit);
+                break;
+            }
+        }
+    }
 }
 
 async fn process_task<TInput, TOutput>(
