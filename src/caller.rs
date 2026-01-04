@@ -7,7 +7,7 @@ use futures_util::StreamExt;
 use mongodb::Collection;
 use mongodb::bson::{Bson, DateTime, Document, doc, to_bson};
 use mongodb::error::{ErrorKind, WriteError, WriteFailure};
-use mongodb::options::{ChangeStreamOptions, FindOneOptions, FullDocumentType};
+use mongodb::options::{ChangeStreamOptions, FindOneOptions, FullDocumentType, UpdateOptions};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -212,42 +212,73 @@ async fn insert_task(
     trace_context: Option<String>,
 ) -> Result<String, RequestError> {
     let task_id = idempotency_key.unwrap_or_else(|| Uuid::new_v4().to_string());
-
     let now = DateTime::now();
-    let doc = doc! {
+
+    // Build the filter: if reset is allowed, also match finished tasks
+    let filter = if caller.config.allow_reset_finished_tasks {
+        doc! {
+            "task_id": &task_id,
+            "$or": [
+                { "status": { "$exists": false } }, // for upsert insert case
+                { "status": { "$in": ["succeeded", "failed"] } },
+            ]
+        }
+    } else {
+        // Only match if document doesn't exist (upsert insert path)
+        doc! {
+            "task_id": &task_id,
+            "status": { "$exists": false }
+        }
+    };
+
+    let mut set_fields = doc! {
         "task_id": &task_id,
-        "task_input": payload.clone(),
+        "task_input": payload,
         "status": "pending",
-        "created_at": now,
         "updated_at": now,
         "worker_switch_timeout": worker_switch_timeout.as_millis() as i64,
     };
-    let mut doc = doc;
-    if let Some(trace) = trace_context.clone() {
-        doc.insert("trace_context", trace);
+    if let Some(trace) = trace_context {
+        set_fields.insert("trace_context", trace);
+    } else {
+        set_fields.insert("trace_context", Bson::Null);
     }
 
-    if let Err(e) = caller.collection.insert_one(doc, None).await {
-        if let ErrorKind::Write(WriteFailure::WriteError(WriteError { code: 11000, .. })) = *e.kind
-        {
-            if caller.config.allow_reset_finished_tasks
-                && try_reset_existing(
-                    caller,
-                    &task_id,
-                    payload,
-                    worker_switch_timeout,
-                    trace_context,
-                )
-                .await?
-            {
-                return Ok(task_id);
-            }
-            return Err(RequestError::Duplicate { task_id });
+    let update = doc! {
+        "$set": set_fields,
+        "$setOnInsert": {
+            "created_at": now,
+        },
+        "$unset": {
+            "task_output": "",
+            "error_reason": "",
+            "worker_state": "",
         }
-        return Err(RequestError::Database(e.to_string()));
-    }
+    };
 
-    Ok(task_id)
+    let options = UpdateOptions::builder().upsert(true).build();
+
+    match caller.collection.update_one(filter, update, options).await {
+        Ok(result) => {
+            // upserted_id is Some if inserted, None if updated an existing doc
+            if result.upserted_id.is_some() || result.matched_count > 0 {
+                Ok(task_id)
+            } else {
+                // No match and no insert means filter didn't match any resetable task
+                // and upsert couldn't insert (shouldn't happen normally)
+                Err(RequestError::Duplicate { task_id })
+            }
+        }
+        Err(e) => {
+            if let ErrorKind::Write(WriteFailure::WriteError(WriteError { code: 11000, .. })) =
+                *e.kind
+            {
+                // Duplicate key = task exists but didn't match update filter (not resetable)
+                return Err(RequestError::Duplicate { task_id });
+            }
+            Err(RequestError::Database(e.to_string()))
+        }
+    }
 }
 
 async fn try_reset_existing(
