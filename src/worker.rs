@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,8 +8,7 @@ type WorkerHandler<TInput, TOutput> = Arc<
 >;
 use futures_util::stream::StreamExt;
 use mongodb::Collection;
-use mongodb::bson::{Bson, DateTime, Document, doc, from_bson, to_bson};
-use tracing_opentelemetry::OpenTelemetrySpanExt;
+use mongodb::bson::{Bson, DateTime, Document, doc, to_bson};
 use mongodb::change_stream::ChangeStream;
 use mongodb::options::{
     ChangeStreamOptions, FindOneAndUpdateOptions, FullDocumentType, ReturnDocument,
@@ -39,7 +37,7 @@ pub struct Worker {
 
 pub struct WorkerJob<TInput> {
     pub task_id: String,
-    pub trace_context: Option<HashMap<String, String>>,
+    pub trace_context: Option<String>,
     pub payload: TInput,
 }
 
@@ -299,7 +297,7 @@ where
         Err(e) => return Err(e), // Can't mark failed without ID
     };
 
-    let setup_result: Result<(TInput, Option<HashMap<String, String>>), RequestError> = async {
+    let setup_result: Result<(TInput, Option<String>), RequestError> = async {
         let payload_bson = doc
             .get("task_input")
             .ok_or(RequestError::PayloadFormat {
@@ -316,7 +314,7 @@ where
                 field: "task_input",
             }
         })?;
-        let trace_context: Option<HashMap<String, String>> = doc.get("trace_context").and_then(|b| from_bson(b.clone()).ok());
+        let trace_context = doc.get_str("trace_context").ok().map(|s| s.to_string());
 
         if !heartbeat(&collection, &task_id, &worker_id).await? {
             error!(%worker_id, %task_id, "lost ownership before handler start");
@@ -339,13 +337,7 @@ where
         }
     };
 
-    let span = tracing::info_span!("worker.process_task", %task_id, %worker_id);
-    if let Some(ref context_map) = trace_context {
-        let parent_context = opentelemetry::global::get_text_map_propagator(|propagator| {
-            propagator.extract(context_map)
-        });
-        span.set_parent(parent_context);
-    }
+    let span = tracing::info_span!("worker.process_task", %task_id, %worker_id, trace_id = ?trace_context);
     let _enter = span.enter();
 
     let job = WorkerJob {

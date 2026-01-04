@@ -96,7 +96,7 @@ Tasks remain durable in Mongo even if no worker is running yet, so `TaskId` look
 | `idempotency_key` | `String` | Same as `task_id`; unique index per collection. |
 | `request_timeout` | `Option<i64>` | Caller-specific timeout in millis (for reference). |
 | `worker_switch_timeout` | `i64` | Delay before another worker may steal the task. |
-| `trace_context` | `Option<Document>` | Serialized W3C Trace Context (HashMap). |
+| `trace_context` | `Option<String>` | Serialized Trace ID string. |
 | `worker_state` | `Document` | Contains `worker_id`, `started_at`, `heartbeat_at` (periodic ping), `finished_at`, `shutdown_reason`. |
 | `error_reason` | `Option<String>` | Worker-provided failure reason or payload format error. |
 
@@ -130,7 +130,7 @@ impl<TOutput> SendBuilder<TOutput> {
     pub fn with_timeout(self, timeout: Duration) -> Self;
     pub fn with_worker_switch_timeout(self, timeout: Duration) -> Self;
     pub fn with_idempotency_key(self, key: impl Into<String>) -> Self;
-    pub fn with_trace_context(self, trace: std::collections::HashMap<String, String>) -> Self;
+    pub fn with_trace_context(self, trace: impl Into<String>) -> Self;
 }
 
 impl<TOutput> Future for SendBuilder<TOutput> {
@@ -140,7 +140,7 @@ impl<TOutput> Future for SendBuilder<TOutput> {
 
 pub struct WorkerJob<TInput> {
     pub task_id: String,
-    pub trace_context: Option<std::collections::HashMap<String, String>>,
+    pub trace_context: Option<String>,
     pub payload: TInput,
 }
 

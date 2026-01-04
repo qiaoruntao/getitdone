@@ -1,10 +1,7 @@
-use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-
-use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 type SendFuture<T> = Pin<Box<dyn Future<Output = Result<T, RequestError>> + Send>>;
 
@@ -57,10 +54,7 @@ impl Caller {
             ),
         };
 
-        let mut trace_context = HashMap::new();
-        opentelemetry::global::get_text_map_propagator(|propagator| {
-            propagator.inject_context(&tracing::Span::current().context(), &mut trace_context);
-        });
+        let trace_context = tracing_opentelemetry_instrumentation_sdk::find_current_trace_id();
 
         SendBuilder {
             caller: self.clone(),
@@ -69,7 +63,7 @@ impl Caller {
             timeout: None,
             worker_switch_timeout: None,
             idempotency_key: None,
-            trace_context: Some(trace_context),
+            trace_context,
             future: None,
             _marker: std::marker::PhantomData,
         }
@@ -100,7 +94,7 @@ where
     timeout: Option<Duration>,
     worker_switch_timeout: Option<Duration>,
     idempotency_key: Option<String>,
-    trace_context: Option<HashMap<String, String>>,
+    trace_context: Option<String>,
     future: Option<SendFuture<TOutput>>,
     _marker: std::marker::PhantomData<TOutput>,
 }
@@ -124,8 +118,8 @@ where
         self
     }
 
-    pub fn with_trace_context(mut self, trace: HashMap<String, String>) -> Self {
-        self.trace_context = Some(trace);
+    pub fn with_trace_context(mut self, trace: impl Into<String>) -> Self {
+        self.trace_context = Some(trace.into());
         self
     }
 
@@ -216,7 +210,7 @@ async fn upsert_task(
     payload: Bson,
     worker_switch_timeout: Duration,
     idempotency_key: Option<String>,
-    trace_context: Option<HashMap<String, String>>,
+    trace_context: Option<String>,
 ) -> Result<String, RequestError> {
     let task_id = idempotency_key.unwrap_or_else(|| Uuid::new_v4().to_string());
     let now = DateTime::now();
@@ -246,8 +240,7 @@ async fn upsert_task(
         "worker_switch_timeout": worker_switch_timeout.as_millis() as i64,
     };
     if let Some(trace) = trace_context {
-        let trace_bson = to_bson(&trace).map_err(|e| RequestError::Database(e.to_string()))?;
-        set_fields.insert("trace_context", trace_bson);
+        set_fields.insert("trace_context", trace);
     } else {
         set_fields.insert("trace_context", Bson::Null);
     }
