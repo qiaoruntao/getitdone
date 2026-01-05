@@ -21,15 +21,17 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{self, Duration as TokioDuration, MissedTickBehavior};
 use tracing::{error, info, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
-use opentelemetry::trace::{SpanContext, TraceId, SpanId, TraceFlags, TraceState};
 use uuid::Uuid;
 
 use crate::config::Config;
 use crate::error::RequestError;
+use crate::trace::TraceContext;
 use crate::storage::connect_collection;
 
 const DEFAULT_MAX_INFLIGHT: usize = 32;
 
+/// Long-lived component that keeps reading the configured Mongo collection,
+/// claims pending tasks, and executes user logic for each `TaskInput`.
 pub struct Worker {
     config: Config,
     collection: Collection<Document>,
@@ -37,13 +39,17 @@ pub struct Worker {
     max_inflight: usize,
 }
 
+/// Wrapper passed to user handlers containing the task id (which doubles as the
+/// idempotency key), the optional caller `TraceContext`, and the typed payload.
 pub struct WorkerJob<TInput> {
     pub task_id: String,
-    pub trace_context: Option<String>,
+    pub trace_context: Option<TraceContext>,
     pub payload: TInput,
 }
 
 impl Worker {
+    /// Connects to the Mongo deployment described by `config`. Use the same config
+    /// that the caller used so both roles share a collection.
     pub async fn connect(config: Config) -> Result<Self, RequestError> {
         let collection = connect_collection(&config).await?;
         Ok(Worker {
@@ -54,6 +60,8 @@ impl Worker {
         })
     }
 
+    /// Starts the background loop with the provided async handler. Each task is
+    /// executed in its own Tokio task up to `max_inflight`.
     pub fn run<TInput, TOutput, H, Fut>(self, handler: H) -> WorkerHandle
     where
         TInput: DeserializeOwned + Send + 'static,
@@ -305,7 +313,7 @@ where
     };
     tracing::Span::current().record("task_id", &task_id);
 
-    let setup_result: Result<(TInput, Option<String>), RequestError> = async {
+    let setup_result: Result<(TInput, Option<TraceContext>), RequestError> = async {
         let payload_bson = doc
             .get("task_input")
             .ok_or(RequestError::PayloadFormat {
@@ -322,10 +330,21 @@ where
                 field: "task_input",
             }
         })?;
-        let trace_context = doc.get_str("trace_context").ok().map(|s| s.to_string());
-        if let Some(ref tid) = trace_context {
-            tracing::Span::current().record("trace_id", tid);
-        }
+        let trace_context = match doc.get("trace_context") {
+            Some(raw) => match raw {
+                Bson::Null => None,
+                _ => {
+                    let ctx: TraceContext = mongodb::bson::from_bson(raw.clone()).map_err(|_| {
+                        RequestError::PayloadFormat {
+                            field: "trace_context",
+                        }
+                    })?;
+                    tracing::Span::current().record("trace_id", ctx.trace_id.as_str());
+                    Some(ctx)
+                }
+            },
+            None => None,
+        };
 
         if !heartbeat(&collection, &task_id, &worker_id).await? {
             error!(%worker_id, %task_id, "lost ownership before handler start");
@@ -347,7 +366,6 @@ where
             return Err(err);
         }
     };
-
 
     let job = WorkerJob {
         task_id: task_id.clone(),
@@ -372,22 +390,17 @@ where
     );
 
     // Add a span link to the caller's trace context if available
-    if let Some(ref caller_trace_id) = trace_context {
-        // Parse the caller's trace_id and create a SpanContext for linking
-        if let Ok(trace_id_bytes) = hex::decode(caller_trace_id) {
-            if trace_id_bytes.len() == 16 {
-                let mut trace_id_arr = [0u8; 16];
-                trace_id_arr.copy_from_slice(&trace_id_bytes);
-                let caller_span_context = SpanContext::new(
-                    TraceId::from_bytes(trace_id_arr),
-                    SpanId::INVALID, // We don't have the original span_id
-                    TraceFlags::SAMPLED,
-                    true, // is_remote
-                    TraceState::default(),
-                );
-                handler_span.add_link(caller_span_context);
-                info!(%task_id, caller_trace_id, "linked worker span to caller trace");
-            }
+    if let Some(ref caller_context) = trace_context {
+        if let Some(span_context) = caller_context.to_span_context() {
+            handler_span.add_link(span_context);
+            info!(
+                %task_id,
+                trace_id = %caller_context.trace_id,
+                span_id = %caller_context.span_id,
+                "linked worker span to caller span"
+            );
+        } else {
+            warn!(%task_id, "trace context present but invalid");
         }
     }
 

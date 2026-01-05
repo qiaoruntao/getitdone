@@ -17,8 +17,11 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::error::RequestError;
+use crate::trace::TraceContext;
 use crate::storage::connect_collection;
 
+/// High-level API a caller uses to submit `TaskInput` payloads into the configured
+/// Mongo collection and await the matching `TaskOutput`.
 #[derive(Clone)]
 pub struct Caller {
     pub(crate) config: Config,
@@ -26,6 +29,8 @@ pub struct Caller {
 }
 
 impl Caller {
+    /// Connects to the Mongo deployment described by `config`. The same config should
+    /// later be handed to a worker so both roles talk to the same collection.
     #[tracing::instrument(skip(config))]
     pub async fn connect(config: Config) -> Result<Self, RequestError> {
         let collection = connect_collection(&config).await?;
@@ -33,6 +38,8 @@ impl Caller {
     }
 
     #[tracing::instrument(skip(self, payload), fields(task_id))]
+    /// Starts building a request that will insert a document and eventually wait for
+    /// the worker response.
     pub fn send<TInput, TOutput>(&self, payload: TInput) -> SendBuilder<TOutput>
     where
         TInput: Serialize,
@@ -57,7 +64,8 @@ impl Caller {
             ),
         };
 
-        let trace_context = tracing_opentelemetry_instrumentation_sdk::find_current_trace_id();
+        // Capture the current OpenTelemetry span so workers can link back to it
+        let trace_context = TraceContext::capture_current();
 
         SendBuilder {
             caller: self.clone(),
@@ -73,6 +81,8 @@ impl Caller {
     }
 
     #[tracing::instrument(skip(self))]
+    /// Rehydrate a `TaskOutput` later on (e.g., after fire-and-forget `dispatch`)
+    /// using the task id returned during submission.
     pub async fn await_response<TOutput>(&self, task_id: String) -> Result<TOutput, RequestError>
     where
         TOutput: DeserializeOwned + Unpin,
@@ -81,6 +91,8 @@ impl Caller {
     }
 
     #[tracing::instrument(skip(self, payload))]
+    /// Fire-and-forget: enqueue a task, return the `task_id` immediately, and let
+    /// another component `await_response` in the future.
     pub async fn dispatch<TInput>(&self, payload: TInput) -> Result<String, RequestError>
     where
         TInput: Serialize,
@@ -89,6 +101,8 @@ impl Caller {
     }
 }
 
+/// Builder returned by `Caller::send` that lets each request override defaults
+/// before actually enqueuing work in Mongo.
 pub struct SendBuilder<TOutput>
 where
     TOutput: DeserializeOwned + Send + Unpin + 'static,
@@ -99,7 +113,7 @@ where
     timeout: Option<Duration>,
     worker_switch_timeout: Option<Duration>,
     idempotency_key: Option<String>,
-    trace_context: Option<String>,
+    trace_context: Option<TraceContext>,
     future: Option<SendFuture<TOutput>>,
     _marker: std::marker::PhantomData<TOutput>,
 }
@@ -108,27 +122,35 @@ impl<TOutput> SendBuilder<TOutput>
 where
     TOutput: DeserializeOwned + Send + Unpin + 'static,
 {
+    /// Override how long this caller waits for the worker response. `None` means
+    /// wait indefinitely, so omitting this call inherits the config default.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
         self
     }
 
+    /// Override the worker switch timeout for this task. This governs how soon
+    /// another worker may steal the document if the current worker goes away.
     pub fn with_worker_switch_timeout(mut self, timeout: Duration) -> Self {
         self.worker_switch_timeout = Some(timeout);
         self
     }
 
+    /// Provide a custom idempotency key. When omitted we auto-generate a UUID.
     pub fn with_idempotency_key(mut self, key: impl Into<String>) -> Self {
         self.idempotency_key = Some(key.into());
         self
     }
 
-    pub fn with_trace_context(mut self, trace: impl Into<String>) -> Self {
-        self.trace_context = Some(trace.into());
+    /// Override the captured tracing metadata. Most callers can skip this and let
+    /// `TraceContext::capture_current` run automatically.
+    pub fn with_trace_context(mut self, trace: TraceContext) -> Self {
+        self.trace_context = Some(trace);
         self
     }
 
     #[tracing::instrument(skip(self))]
+    /// Only insert the Mongo document and return the resulting `task_id`.
     pub async fn enqueue_only(self) -> Result<String, RequestError> {
         let SendBuilder {
             caller,
@@ -218,7 +240,7 @@ async fn upsert_task(
     payload: Bson,
     worker_switch_timeout: Duration,
     idempotency_key: Option<String>,
-    trace_context: Option<String>,
+    trace_context: Option<TraceContext>,
 ) -> Result<String, RequestError> {
     let task_id = idempotency_key.unwrap_or_else(|| Uuid::new_v4().to_string());
     tracing::Span::current().record("task_id", &task_id);
@@ -249,7 +271,10 @@ async fn upsert_task(
         "worker_switch_timeout": worker_switch_timeout.as_millis() as i64,
     };
     if let Some(trace) = trace_context {
-        set_fields.insert("trace_context", trace);
+        let trace_bson = mongodb::bson::to_bson(&trace).map_err(|_| RequestError::PayloadFormat {
+            field: "trace_context",
+        })?;
+        set_fields.insert("trace_context", trace_bson);
     } else {
         set_fields.insert("trace_context", Bson::Null);
     }

@@ -77,7 +77,7 @@ assert_eq!(result.length, 5);
 worker_handle.shutdown().await?;
 ```
 
-Handlers receive a `WorkerJob<TInput>` that exposes the `task_id`, optional `trace_context`, and the typed payload so they can log or open child spans without additional plumbing.
+Handlers receive a `WorkerJob<TInput>` that exposes the `task_id`, optional `TraceContext`, and the typed payload so they can log or open child spans without extra plumbing.
 
 No queues, no events, no extra ceremonies exposed to the user—just a round trip with a tiny bit of scheduling under the hood.
 
@@ -103,7 +103,7 @@ The builder always yields a `Result<TaskOutput, RequestError>`. `Ok` means the w
 - `.with_timeout` overrides how long this caller waits for a response.
 - `.with_worker_switch_timeout` controls when another worker may steal the task if the current worker disappears (defaults to the config value).
 - `.with_idempotency_key` deduplicates duplicate submissions.
-- `.with_trace_context` lets you override the captured tracing context (optional).
+- `.with_trace_context` takes a `TraceContext` so you can override the captured tracing metadata (optional).
 - `.reset_finished_tasks(true)` combined with `build_with_reset().await` reopens succeeded/failed tasks when an application restarts.
 - If a worker or caller tries to deserialize a task into the wrong type, the worker will emit `RequestError::PayloadFormat` and mark the task as failed. Each collection must stick to a single pair of Rust types to avoid these errors.
 
@@ -122,13 +122,18 @@ tracing::info_span!("resize-request", request_id = %uuid).in_scope(|| async {
 If you need to override the context (for example, bridging from a different tracing backend), call the builder-style API and provide the context explicitly:
 
 ```rust
+use getitdone::TraceContext;
+
+let external_trace = TraceContext::from_parts(trace_id_hex, span_id_hex);
 let result = caller
     .send(ResizeImageInput { /* … */ })
     .with_trace_context(external_trace)
     .await?;
 ```
 
-The worker receives the same `TraceContext` alongside `TaskInput` via `WorkerJob::trace_context`, making it easy to start a child span or emit logs with the parent trace id. Skip `.with_trace_context` if you want to rely on the automatically captured context.
+Need to override sampling? Construct it with `TraceContext::from_parts_with_flags` and pass an explicit `TraceFlags`.
+
+The worker receives the same `TraceContext` alongside `TaskInput` via `WorkerJob::trace_context`, making it easy to start a child span or emit logs with the parent trace id. The identifiers are stored as a Mongo document (`{ trace_id, span_id, trace_flags }`) and the worker adds an explicit span link so tracing backends can stitch caller/worker activity without extra plumbing. Skip `.with_trace_context` if you want to rely on the automatically captured context.
 
 
 ### Long-running or fire-and-forget

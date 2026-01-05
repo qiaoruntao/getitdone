@@ -26,7 +26,7 @@ This document describes the minimal architecture behind the caller/worker flow. 
 | `TaskInput` | User payload that describes the work. Implements `Serialize + DeserializeOwned + Send + 'static`. |
 | `TaskOutput` | Response payload returned by the worker. Same trait bounds as `TaskInput`. |
 | `String` | Unique identifier assigned to each task so callers can re-fetch/await results later. |
-| `TraceContext` | Optional trace/span identifiers propagated from caller to worker. |
+| `TraceContext` | Optional struct with `trace_id`/`span_id`/`trace_flags` propagated from caller to worker (stored as a Mongo document). |
 | `Config` | MongoDB connection info plus collection name and optional knobs (timeouts, visibility, worker switch delay). |
 | `Caller` | API surface for sending a `TaskInput` and waiting for a `TaskOutput`. |
 | `Worker` | Loop that polls tasks from MongoDB, runs a user-provided async function, and writes back the response. |
@@ -65,6 +65,8 @@ Workers automatically mark their in-flight tasks as failed (with a shutdown reas
 
 Tasks remain durable in Mongo even if no worker is running yet, so `TaskId` lookups keep working across restarts.
 
+Trace propagation is automatic: `Caller::send` captures the current OpenTelemetry context, stores `{ trace_id, span_id, trace_flags }` inside the task document, and the worker rehydrates that struct so the `worker.handler` span can attach an explicit link to the caller span. Custom propagators can override the value via `.with_trace_context`.
+
 ---
 
 ### Module sketch
@@ -96,7 +98,7 @@ Tasks remain durable in Mongo even if no worker is running yet, so `TaskId` look
 | `idempotency_key` | `String` | Same as `task_id`; unique index per collection. |
 | `request_timeout` | `Option<i64>` | Caller-specific timeout in millis (for reference). |
 | `worker_switch_timeout` | `i64` | Delay before another worker may steal the task. |
-| `trace_context` | `Option<String>` | Serialized Trace ID string. |
+| `trace_context` | `Option<Document>` | Serialized `TraceContext` (`{ trace_id, span_id, trace_flags }`). |
 | `worker_state` | `Document` | Contains `worker_id`, `started_at`, `heartbeat_at` (periodic ping), `finished_at`, `shutdown_reason`. |
 | `error_reason` | `Option<String>` | Worker-provided failure reason or payload format error. |
 
@@ -130,7 +132,7 @@ impl<TOutput> SendBuilder<TOutput> {
     pub fn with_timeout(self, timeout: Duration) -> Self;
     pub fn with_worker_switch_timeout(self, timeout: Duration) -> Self;
     pub fn with_idempotency_key(self, key: impl Into<String>) -> Self;
-    pub fn with_trace_context(self, trace: impl Into<String>) -> Self;
+    pub fn with_trace_context(self, trace: TraceContext) -> Self;
 }
 
 impl<TOutput> Future for SendBuilder<TOutput> {
@@ -140,7 +142,7 @@ impl<TOutput> Future for SendBuilder<TOutput> {
 
 pub struct WorkerJob<TInput> {
     pub task_id: String,
-    pub trace_context: Option<String>,
+    pub trace_context: Option<TraceContext>,
     pub payload: TInput,
 }
 

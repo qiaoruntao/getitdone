@@ -1,12 +1,14 @@
 mod caller;
 mod config;
 mod error;
+mod trace;
 mod storage;
 mod worker;
 
 pub use caller::{Caller, SendBuilder};
 pub use config::{Config, ConfigBuilder};
 pub use error::RequestError;
+pub use trace::TraceContext;
 pub use worker::{Worker, WorkerHandle, WorkerJob};
 
 pub fn init_tracing_otlp(service_name: &str, endpoint: &str) -> Result<init_tracing_opentelemetry::Guard, Box<dyn std::error::Error>> {
