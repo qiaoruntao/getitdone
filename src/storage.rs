@@ -23,7 +23,7 @@ pub async fn connect_collection(config: &Config) -> Result<Collection<Document>,
 }
 
 async fn warn_if_missing_indexes(collection: &Collection<Document>) {
-    let mut cursor = match collection.list_indexes(None).await {
+    let mut cursor = match collection.list_indexes().await {
         Ok(cursor) => cursor,
         Err(err) => {
             #[cfg(feature = "tracing")]

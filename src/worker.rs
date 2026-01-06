@@ -6,14 +6,12 @@ use futures_util::future::{BoxFuture, Either, FutureExt};
 type WorkerHandler<TInput, TOutput> = Arc<
     dyn Fn(WorkerJob<TInput>) -> BoxFuture<'static, Result<TOutput, RequestError>> + Send + Sync,
 >;
+use bson::{Bson, DateTime, Document, doc};
 use futures_util::stream::StreamExt;
 use mongodb::Collection;
-use mongodb::bson::{Bson, DateTime, Document, doc, to_bson};
-use mongodb::change_stream::ChangeStream;
+use mongodb::change_stream::{ChangeStream, event::ChangeStreamEvent};
 use mongodb::error::{CommandError, ErrorKind};
-use mongodb::options::{
-    ChangeStreamOptions, FindOneAndUpdateOptions, FullDocumentType, ReturnDocument,
-};
+use mongodb::options::{FullDocumentType, ReturnDocument};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
@@ -268,18 +266,16 @@ async fn claim_next_task(
             }
         }
     };
-    let options = FindOneAndUpdateOptions::builder()
-        .return_document(ReturnDocument::After)
-        .build();
     collection
-        .find_one_and_update(filter, update, options)
+        .find_one_and_update(filter, update)
+        .return_document(ReturnDocument::After)
         .await
         .map_err(|e| RequestError::Database(e.to_string()))
 }
 
 async fn open_change_stream(
     collection: &Collection<Document>,
-) -> Result<Option<ChangeStream<Document>>, RequestError> {
+) -> Result<Option<ChangeStream<ChangeStreamEvent<Document>>>, RequestError> {
     let pipeline = vec![doc! {
         "$match": {
             "$or": [
@@ -291,11 +287,13 @@ async fn open_change_stream(
             ]
         }
     }];
-    let options = ChangeStreamOptions::builder()
-        .full_document(Some(FullDocumentType::UpdateLookup))
-        .build();
-    match collection.watch(pipeline, Some(options)).await {
-        Ok(stream) => Ok(Some(stream.with_type())),
+    match collection
+        .watch()
+        .pipeline(pipeline)
+        .full_document(FullDocumentType::UpdateLookup)
+        .await
+    {
+        Ok(stream) => Ok(Some(stream)),
         Err(e) => {
             if is_change_stream_unsupported(&e) {
                 return Err(RequestError::Database(
@@ -405,7 +403,7 @@ where
             })?
             .clone();
         let payload: TInput =
-            mongodb::bson::from_bson(payload_bson).map_err(|_| RequestError::PayloadFormat {
+            bson::deserialize_from_bson(payload_bson).map_err(|_| RequestError::PayloadFormat {
                 field: "task_input",
             })?;
 
@@ -414,7 +412,7 @@ where
             if raw == &Bson::Null {
                 return None;
             }
-            let ctx: TraceContext = mongodb::bson::from_bson(raw.clone()).ok()?;
+            let ctx: TraceContext = bson::deserialize_from_bson(raw.clone()).ok()?;
             tracing::Span::current().record("trace_id", ctx.trace_id.as_str());
             Some(ctx)
         });
@@ -490,9 +488,10 @@ where
     let _ = hb_stop_tx.send(());
     match handler_result {
         Ok(output) => {
-            let output_bson: Bson = to_bson(&output).map_err(|_| RequestError::PayloadFormat {
-                field: "task_output",
-            })?;
+            let output_bson: Bson =
+                bson::serialize_to_bson(&output).map_err(|_| RequestError::PayloadFormat {
+                    field: "task_output",
+                })?;
             let filter = doc! {
                 "task_id": &task_id,
                 "status": "running",
@@ -507,7 +506,7 @@ where
                 }
             };
             let result = collection
-                .update_one(filter, update, None)
+                .update_one(filter, update)
                 .await
                 .map_err(|e| RequestError::Database(e.to_string()))?;
             if result.matched_count == 0 {
@@ -537,7 +536,7 @@ async fn mark_task_failed(collection: &Collection<Document>, task_id: &str, reas
         }
     };
     if let Err(_e) = collection
-        .update_one(doc! {"task_id": task_id}, update, None)
+        .update_one(doc! {"task_id": task_id}, update)
         .await
     {
         #[cfg(feature = "tracing")]
@@ -560,7 +559,7 @@ async fn heartbeat(
         "$set": {"worker_state.heartbeat_at": DateTime::now()}
     };
     let result = collection
-        .update_one(filter, update, None)
+        .update_one(filter, update)
         .await
         .map_err(|e| RequestError::Database(e.to_string()))?;
     Ok(result.matched_count > 0)

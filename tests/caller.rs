@@ -1,6 +1,6 @@
+use bson::{Document, doc, serialize_to_bson};
 use getitdone::{Caller, Config, RequestError, TraceContext, inspect_task};
 use mongodb::Client;
-use mongodb::bson::{Document, doc, to_bson};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -40,7 +40,7 @@ async fn test_config() -> Config {
 
 async fn mongo_available(config: &Config) -> bool {
     match Client::with_uri_str(&config.mongo_uri).await {
-        Ok(client) => client.list_database_names(None, None).await.is_ok(),
+        Ok(client) => client.list_database_names().await.is_ok(),
         Err(_) => false,
     }
 }
@@ -50,7 +50,7 @@ async fn drop_collection(config: &Config) {
         let _ = client
             .database(&config.database)
             .collection::<Document>(&config.collection)
-            .drop(None)
+            .drop()
             .await;
     }
 }
@@ -96,7 +96,7 @@ async fn builder_overrides_are_persisted() {
     let stored = client
         .database(&config.database)
         .collection::<Document>(&config.collection)
-        .find_one(doc! { "task_id": &task_id }, None)
+        .find_one(doc! { "task_id": &task_id })
         .await
         .unwrap()
         .expect("task stored");
@@ -126,27 +126,21 @@ async fn inspect_task_handles_success_failure_and_missing() {
         value: "done".into(),
     };
     collection
-        .insert_one(
-            doc! {
-                "task_id": success_id,
-                "status": "succeeded",
-                "task_output": to_bson(&success_output).unwrap(),
-            },
-            None,
-        )
+        .insert_one(doc! {
+            "task_id": success_id,
+            "status": "succeeded",
+            "task_output": serialize_to_bson(&success_output).unwrap(),
+        })
         .await
         .unwrap();
 
     let failure_id = "failure_case";
     collection
-        .insert_one(
-            doc! {
-                "task_id": failure_id,
-                "status": "failed",
-                "error_reason": "boom",
-            },
-            None,
-        )
+        .insert_one(doc! {
+            "task_id": failure_id,
+            "status": "failed",
+            "error_reason": "boom",
+        })
         .await
         .unwrap();
 

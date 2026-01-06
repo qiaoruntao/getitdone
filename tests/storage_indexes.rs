@@ -19,7 +19,7 @@ async fn drop_collection(config: &Config) {
         let _ = client
             .database(&config.database)
             .collection::<mongodb::bson::Document>(&config.collection)
-            .drop(None)
+            .drop()
             .await;
     }
 }
@@ -34,10 +34,10 @@ async fn warn_if_indexes_missing_on_existing_collection() {
         .database(&config.database)
         .collection::<mongodb::bson::Document>(&config.collection);
     collection
-        .insert_one(doc! { "bootstrap": true }, None)
+        .insert_one(doc! { "bootstrap": true })
         .await
         .unwrap();
-    collection.delete_many(doc! {}, None).await.unwrap();
+    collection.delete_many(doc! {}).await.unwrap();
 
     // Caller::connect triggers the warn_if_missing_indexes path.
     let _caller = Caller::connect(config.clone()).await.unwrap();

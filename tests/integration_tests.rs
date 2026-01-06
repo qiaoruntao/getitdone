@@ -43,7 +43,7 @@ async fn ensure_test_indexes(config: &Config) {
             .keys(doc! {"worker_state.worker_id": 1})
             .build(),
     ];
-    let _ = collection.create_indexes(index_model, None).await;
+    let _ = collection.create_indexes(index_model).await;
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]

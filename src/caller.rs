@@ -5,11 +5,11 @@ use std::time::Duration;
 
 type SendFuture<T> = Pin<Box<dyn Future<Output = Result<T, RequestError>> + Send>>;
 
+use bson::{Bson, DateTime, Document, doc};
 use futures_util::StreamExt;
 use mongodb::Collection;
-use mongodb::bson::{Bson, DateTime, Document, doc};
 use mongodb::error::{ErrorKind, WriteError, WriteFailure};
-use mongodb::options::{ChangeStreamOptions, FindOneOptions, FullDocumentType, UpdateOptions};
+use mongodb::options::FullDocumentType;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
@@ -54,8 +54,7 @@ impl Caller {
         TInput: Serialize,
         TOutput: DeserializeOwned + Send + Unpin + 'static,
     {
-        use mongodb::bson::to_bson;
-        let (payload, payload_err) = match to_bson(&payload) {
+        let (payload, payload_err) = match bson::serialize_to_bson(&payload) {
             Ok(bson) => (Some(bson), None),
             Err(_) => (
                 None,
@@ -309,7 +308,7 @@ async fn upsert_task(
     #[cfg(feature = "tracing")]
     let trace_bson = trace_context
         .and_then(|trace| {
-            mongodb::bson::to_bson(&trace)
+            bson::serialize_to_bson(&trace)
                 .map_err(|e| {
                     warn!(error=%e, "failed to serialize trace_context; proceeding without trace");
                     e
@@ -335,9 +334,12 @@ async fn upsert_task(
         }
     };
 
-    let options = UpdateOptions::builder().upsert(true).build();
-
-    match caller.collection.update_one(filter, update, options).await {
+    match caller
+        .collection
+        .update_one(filter, update)
+        .upsert(true)
+        .await
+    {
         Ok(result) => {
             // upserted_id is Some if inserted, None if updated an existing doc
             if result.upserted_id.is_some() || result.matched_count > 0 {
@@ -382,7 +384,7 @@ where
     TOutput: DeserializeOwned + Unpin,
 {
     let doc = collection
-        .find_one(doc! {"task_id": task_id}, FindOneOptions::default())
+        .find_one(doc! {"task_id": task_id})
         .await
         .map_err(|e| RequestError::Database(e.to_string()))?;
     let Some(doc) = doc else {
@@ -405,11 +407,10 @@ where
             "fullDocument.task_id": task_id
         }
     }];
-    let options = ChangeStreamOptions::builder()
-        .full_document(Some(FullDocumentType::UpdateLookup))
-        .build();
     let mut stream = collection
-        .watch(pipeline, options)
+        .watch()
+        .pipeline(pipeline)
+        .full_document(FullDocumentType::UpdateLookup)
         .await
         .map_err(|e| RequestError::Database(e.to_string()))?;
     while let Some(event_result) = stream.next().await {
@@ -444,7 +445,7 @@ where
             })?
             .clone();
         let value: TOutput =
-            mongodb::bson::from_bson(output_bson).map_err(|_| RequestError::PayloadFormat {
+            bson::deserialize_from_bson(output_bson).map_err(|_| RequestError::PayloadFormat {
                 field: "task_output",
             })?;
         return Ok(Some(Ok(value)));
