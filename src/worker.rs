@@ -10,6 +10,7 @@ use futures_util::stream::StreamExt;
 use mongodb::Collection;
 use mongodb::bson::{Bson, DateTime, Document, doc, to_bson};
 use mongodb::change_stream::ChangeStream;
+use mongodb::error::{CommandError, ErrorKind};
 use mongodb::options::{
     ChangeStreamOptions, FindOneAndUpdateOptions, FullDocumentType, ReturnDocument,
 };
@@ -25,8 +26,8 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::error::RequestError;
-use crate::trace::TraceContext;
 use crate::storage::connect_collection;
+use crate::trace::TraceContext;
 
 const DEFAULT_MAX_INFLIGHT: usize = 32;
 
@@ -104,14 +105,21 @@ async fn worker_loop<TInput, TOutput>(
     worker_id: String,
     max_inflight: usize,
     handler: WorkerHandler<TInput, TOutput>,
-) where
+) -> Result<(), RequestError>
+where
     TInput: DeserializeOwned + Send + 'static,
     TOutput: Serialize + Send + Sync + 'static,
 {
     let semaphore = Arc::new(Semaphore::new(max_inflight));
     let mut join_set = JoinSet::new();
-    let mut change_stream = open_change_stream(&collection).await;
-    
+    let mut change_stream = match open_change_stream(&collection).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            error!(error=%err, "change streams unavailable; worker exiting");
+            return Err(err);
+        }
+    };
+
     pump_available_tasks(
         &collection,
         &worker_id,
@@ -121,10 +129,16 @@ async fn worker_loop<TInput, TOutput>(
         &mut join_set,
     )
     .await;
-    
+
     loop {
         if change_stream.is_none() {
-            change_stream = open_change_stream(&collection).await;
+            change_stream = match open_change_stream(&collection).await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    error!(error=%err, "change streams unavailable; worker exiting");
+                    return Err(err);
+                }
+            };
             pump_available_tasks(
                 &collection,
                 &worker_id,
@@ -181,6 +195,24 @@ async fn worker_loop<TInput, TOutput>(
             Err(e) => error!(error=%e, "worker task panicked"),
         }
     }
+    Ok(())
+}
+
+fn is_change_stream_unsupported(error: &mongodb::error::Error) -> bool {
+    match error.kind.as_ref() {
+        ErrorKind::Command(CommandError {
+            code, code_name, ..
+        }) => {
+            matches!(code, 40573 | 40574 | 40615)
+                || code_name.eq_ignore_ascii_case("ChangeStreamNotSupported")
+                || code_name.eq_ignore_ascii_case("Location40573")
+        }
+        _ => {
+            let msg = error.to_string();
+            msg.contains("$changeStream stage is only supported")
+                || msg.contains("ChangeStreamNotSupported")
+        }
+    }
 }
 
 #[tracing::instrument(skip(collection))]
@@ -219,7 +251,9 @@ async fn claim_next_task(
         .map_err(|e| RequestError::Database(e.to_string()))
 }
 
-async fn open_change_stream(collection: &Collection<Document>) -> Option<ChangeStream<Document>> {
+async fn open_change_stream(
+    collection: &Collection<Document>,
+) -> Result<Option<ChangeStream<Document>>, RequestError> {
     let pipeline = vec![doc! {
         "$match": {
             "$or": [
@@ -235,10 +269,16 @@ async fn open_change_stream(collection: &Collection<Document>) -> Option<ChangeS
         .full_document(Some(FullDocumentType::UpdateLookup))
         .build();
     match collection.watch(pipeline, Some(options)).await {
-        Ok(stream) => Some(stream.with_type()),
+        Ok(stream) => Ok(Some(stream.with_type())),
         Err(e) => {
+            if is_change_stream_unsupported(&e) {
+                return Err(RequestError::Database(
+                    "change streams unsupported; MongoDB must be a replica set or sharded cluster"
+                        .into(),
+                ));
+            }
             warn!(error=%e, "failed to open change stream");
-            None
+            Ok(None)
         }
     }
 }
@@ -256,9 +296,8 @@ async fn pump_available_tasks<TInput, TOutput>(
     TOutput: Serialize + Send + Sync + 'static,
 {
     loop {
-        let permit = match semaphore.clone().try_acquire_owned() {
-            Ok(p) => p,
-            Err(_) => break,
+        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+            break;
         };
         match claim_next_task(collection, worker_id, worker_switch_timeout).await {
             Ok(Some(task)) => {
@@ -288,7 +327,10 @@ async fn pump_available_tasks<TInput, TOutput>(
     }
 }
 
-#[tracing::instrument(skip(collection, doc, handler, permit), fields(task_id, worker_id, trace_id))]
+#[tracing::instrument(
+    skip(collection, doc, handler, permit),
+    fields(task_id, worker_id, trace_id)
+)]
 async fn process_task<TInput, TOutput>(
     collection: Collection<Document>,
     doc: Document,
@@ -313,45 +355,37 @@ where
     };
     tracing::Span::current().record("task_id", &task_id);
 
-    let setup_result: Result<(TInput, Option<TraceContext>), RequestError> = async {
+    let setup_result: Result<(TInput, Option<TraceContext>), RequestError> = (|| async {
         let payload_bson = doc
             .get("task_input")
             .ok_or(RequestError::PayloadFormat {
                 field: "task_input",
             })?
             .clone();
-        let payload_value: Value = mongodb::bson::from_bson(payload_bson).map_err(|_| {
-            RequestError::PayloadFormat {
+        let payload_value: Value =
+            mongodb::bson::from_bson(payload_bson).map_err(|_| RequestError::PayloadFormat {
                 field: "task_input",
-            }
-        })?;
-        let payload: TInput = serde_json::from_value(payload_value).map_err(|_| {
-            RequestError::PayloadFormat {
+            })?;
+        let payload: TInput =
+            serde_json::from_value(payload_value).map_err(|_| RequestError::PayloadFormat {
                 field: "task_input",
+            })?;
+            
+        let trace_context = doc.get("trace_context").and_then(|raw| {
+            if raw == &Bson::Null {
+                return None;
             }
-        })?;
-        let trace_context = match doc.get("trace_context") {
-            Some(raw) => match raw {
-                Bson::Null => None,
-                _ => {
-                    let ctx: TraceContext = mongodb::bson::from_bson(raw.clone()).map_err(|_| {
-                        RequestError::PayloadFormat {
-                            field: "trace_context",
-                        }
-                    })?;
-                    tracing::Span::current().record("trace_id", ctx.trace_id.as_str());
-                    Some(ctx)
-                }
-            },
-            None => None,
-        };
+            let ctx: TraceContext = mongodb::bson::from_bson(raw.clone()).ok()?;
+            tracing::Span::current().record("trace_id", ctx.trace_id.as_str());
+            Some(ctx)
+        });
 
         if !heartbeat(&collection, &task_id, &worker_id).await? {
             error!(%worker_id, %task_id, "lost ownership before handler start");
             return Err(RequestError::WorkerGone);
         }
         Ok((payload, trace_context))
-    }
+    })()
     .await;
 
     let (payload, trace_context) = match setup_result {
@@ -511,18 +545,33 @@ fn start_heartbeat_loop(
     });
 }
 
+/// Guard returned by `Worker::run` so callers can trigger graceful shutdowns
+/// (and automatically abort the worker task on drop).
 pub struct WorkerHandle {
     stop_signal: Option<oneshot::Sender<()>>,
-    join_handle: Option<JoinHandle<()>>,
+    join_handle: Option<JoinHandle<Result<(), RequestError>>>,
 }
 
 impl WorkerHandle {
+    /// Ask the worker loop to stop, then await the background task.
     pub async fn shutdown(mut self) {
         if let Some(tx) = self.stop_signal.take() {
             let _ = tx.send(());
         }
         if let Some(handle) = self.join_handle.take() {
             let _ = handle.await;
+        }
+    }
+
+    /// Await the worker without sending a stop signal. Useful for detecting early exits.
+    pub async fn wait(mut self) -> Result<(), RequestError> {
+        if let Some(handle) = self.join_handle.take() {
+            match handle.await {
+                Ok(result) => result,
+                Err(_) => Err(RequestError::WorkerGone),
+            }
+        } else {
+            Ok(())
         }
     }
 }

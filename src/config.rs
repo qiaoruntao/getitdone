@@ -1,9 +1,5 @@
 use std::time::Duration;
 
-use mongodb::{Client, bson::doc};
-
-use crate::error::RequestError;
-
 /// Configuration shared by callers and workers.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -59,7 +55,7 @@ impl ConfigBuilder {
         self
     }
 
-    /// Reset succeeded/failed tasks back to pending when building via [`build_with_reset`].
+    /// Allow callers to reuse task ids even if documents are already succeeded/failed.
     pub fn reset_finished_tasks(mut self, enable: bool) -> Self {
         self.reset_finished_to_pending = enable;
         self
@@ -67,15 +63,6 @@ impl ConfigBuilder {
 
     pub fn build(self) -> Config {
         self.finalize()
-    }
-
-    pub async fn build_with_reset(self) -> Result<Config, RequestError> {
-        let reset = self.reset_finished_to_pending;
-        let config = self.finalize();
-        if reset {
-            reset_finished_tasks(&config).await?;
-        }
-        Ok(config)
     }
 
     fn finalize(self) -> Config {
@@ -91,32 +78,4 @@ impl ConfigBuilder {
             allow_reset_finished_tasks: self.reset_finished_to_pending,
         }
     }
-}
-
-async fn reset_finished_tasks(config: &Config) -> Result<(), RequestError> {
-    let client = Client::with_uri_str(&config.mongo_uri)
-        .await
-        .map_err(|e| RequestError::Database(e.to_string()))?;
-    let collection = client
-        .database(&config.database)
-        .collection::<mongodb::bson::Document>(&config.collection);
-    let filter = doc! {
-        "status": { "$in": ["succeeded", "failed"] }
-    };
-    let update = doc! {
-        "$set": {
-            "status": "pending",
-            "updated_at": mongodb::bson::DateTime::now(),
-        },
-        "$unset": {
-            "task_output": "",
-            "error_reason": "",
-            "worker_state": "",
-        }
-    };
-    collection
-        .update_many(filter, update, None)
-        .await
-        .map_err(|e| RequestError::Database(e.to_string()))?;
-    Ok(())
 }

@@ -5,7 +5,8 @@ use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _guard = getitdone::init_tracing_otlp("string-length-example", "http://localhost:4317")?;
+    let _guard =
+        getitdone::init_test_tracing("string-length-example", Some("http://localhost:4317"))?;
     let config = Config::builder()
         .mongo_uri("mongodb://localhost:27017")
         .database("Test")
@@ -30,7 +31,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let worker_handle = match Worker::connect(config).await {
         Ok(worker) => worker.run(|job: WorkerJob<LengthRequest>| async move {
-            info!("Worker processing task with trace_id: {:?}", job.trace_context);
+            info!(
+                "Worker processing task with trace_id: {:?}",
+                job.trace_context
+            );
             Ok(LengthResponse {
                 length: job.payload.text.chars().count(),
             })

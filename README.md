@@ -33,15 +33,16 @@ let config = getitdone::Config::builder()
     .collection("image_resize")
     .request_timeout(None) // None => allow tasks to run indefinitely
     .worker_switch_timeout(Duration::from_secs(10))
-    .reset_finished_tasks(true)
-    .build_with_reset()
-    .await?;
+    .reset_finished_tasks(true) // allow reusing ids for finished tasks
+    .build();
 
 let caller = getitdone::Caller::connect(config.clone()).await?;
 let worker_handle = getitdone::Worker::connect(config).await?.spawn();
 ```
 
 Once the config exists, the caller and worker can live in different binaries as long as they point to the same MongoDB deployment.
+
+Workers rely on MongoDB change streams, so the deployment must be a replica set or sharded cluster. The crate will surface a `RequestError::Database` if change streams are disabled (e.g., standalone localhost instances).
 
 ### Example flow
 
@@ -83,6 +84,18 @@ No queues, no events, no extra ceremonies exposed to the user—just a round tri
 
 Behind the scenes both sides read/write the same MongoDB collection defined by the config. Each task document stores the input payload, which worker claimed it, and the final output so any caller that knows the task id can fetch the response later.
 
+#### Recommended indexes
+
+`getitdone` no longer auto-creates indexes. Add them yourself once per collection to keep idempotency and worker steals fast:
+
+```js
+db.collection.createIndex({ task_id: 1 }, { unique: true })
+db.collection.createIndex({ status: 1, updated_at: 1 })
+db.collection.createIndex({ "worker_state.worker_id": 1 })
+```
+
+If they’re missing we’ll log a warning at startup, but the code will continue running.
+
 ### Per-request options
 
 `caller.send(...)` returns a builder so each invocation can tweak behavior before awaiting the result:
@@ -104,7 +117,7 @@ The builder always yields a `Result<TaskOutput, RequestError>`. `Ok` means the w
 - `.with_worker_switch_timeout` controls when another worker may steal the task if the current worker disappears (defaults to the config value).
 - `.with_idempotency_key` deduplicates duplicate submissions.
 - `.with_trace_context` takes a `TraceContext` so you can override the captured tracing metadata (optional).
-- `.reset_finished_tasks(true)` combined with `build_with_reset().await` reopens succeeded/failed tasks when an application restarts.
+- `.reset_finished_tasks(true)` lets you reuse task ids that already finished (helpful for manual retries after a restart).
 - If a worker or caller tries to deserialize a task into the wrong type, the worker will emit `RequestError::PayloadFormat` and mark the task as failed. Each collection must stick to a single pair of Rust types to avoid these errors.
 
 ### Tracing and metadata

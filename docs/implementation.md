@@ -49,7 +49,17 @@ pub struct Config {
 - The caller and worker must be created from the same `Config`.
 - Each queue maps to a Mongo collection containing pending tasks plus worker state.
 - Optional knobs let us decide how long a caller waits and how soon a worker can steal in-flight work (including per-task switch delays).
-- Builders can call `reset_finished_tasks(true)` and use `build_with_reset()` to reopen succeeded/failed tasks when an application restarts.
+- Builders can call `reset_finished_tasks(true)` if they want to reuse task ids that already finished (handy when replaying work manually after a restart).
+
+Workers rely on MongoDB change streams, so the deployment must be a replica set or sharded cluster. Standalone servers without change-stream support cause `Worker::connect` to error immediately.
+
+We no longer auto-create indexes. Operators should provision them once per collection:
+
+- `db.collection.createIndex({ task_id: 1 }, { unique: true })`
+- `db.collection.createIndex({ status: 1, updated_at: 1 })`
+- `db.collection.createIndex({ "worker_state.worker_id": 1 })`
+
+Missing indexes only trigger warnings at runtime.
 
 ---
 
