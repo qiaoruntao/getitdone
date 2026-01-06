@@ -9,3 +9,4 @@ Quick reminders for anyone touching this repository:
 5. **Trace context is automatic** – `Caller::send` captures the current tracing/span context. Examples should never require a manual `.clone()` unless overriding via `send_with_context`.
 6. **Docs first** – README stays high-level and conceptual; `docs/implementation.md` captures the architecture. Keep them in sync whenever the API shape changes.
 7. **Preserve docs** – don’t delete doc sections unless they conflict with new decisions or we explicitly need to clean up obsolete content. Prefer additive updates.
+8. **Tests live under `tests/`** – keep unit/integration tests in the Cargo `tests` directory. Avoid embedding large test modules inside `src/` files so the crate code stays clean and library users aren’t forced to compile test-only logic.

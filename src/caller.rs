@@ -17,7 +17,9 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::error::RequestError;
 use crate::storage::connect_collection;
+#[cfg(feature = "tracing")]
 use crate::trace::TraceContext;
+#[cfg(feature = "tracing")]
 use tracing::warn;
 
 /// High-level API a caller uses to submit `TaskInput` payloads into the configured
@@ -35,13 +37,16 @@ impl Caller {
     }
     /// Connects to the Mongo deployment described by `config`. The same config should
     /// later be handed to a worker so both roles talk to the same collection.
-    #[tracing::instrument(skip(config))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip(config)))]
     pub async fn connect(config: Config) -> Result<Self, RequestError> {
         let collection = connect_collection(&config).await?;
         Ok(Caller { config, collection })
     }
 
-    #[tracing::instrument(skip(self, payload), fields(task_id))]
+    #[cfg_attr(
+        feature = "tracing",
+        tracing::instrument(skip(self, payload), fields(task_id))
+    )]
     /// Starts building a request that will insert a document and eventually wait for
     /// the worker response.
     pub fn send<TInput, TOutput>(&self, payload: TInput) -> SendBuilder<TOutput>
@@ -61,7 +66,10 @@ impl Caller {
         };
 
         // Capture the current OpenTelemetry span so workers can link back to it
+        #[cfg(feature = "tracing")]
         let trace_context = TraceContext::capture_current();
+        #[cfg(not(feature = "tracing"))]
+        let trace_context = None;
 
         SendBuilder {
             caller: self.clone(),
@@ -76,7 +84,7 @@ impl Caller {
         }
     }
 
-    #[tracing::instrument(skip(self))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip(self)))]
     /// Rehydrate a `TaskOutput` later on (e.g., after fire-and-forget `dispatch`)
     /// using the task id returned during submission.
     pub async fn await_response<TOutput>(&self, task_id: String) -> Result<TOutput, RequestError>
@@ -86,7 +94,7 @@ impl Caller {
         wait_for_result::<TOutput>(&self.collection, &task_id).await
     }
 
-    #[tracing::instrument(skip(self, payload))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip(self, payload)))]
     /// Fire-and-forget: enqueue a task, return the `task_id` immediately, and let
     /// another component `await_response` in the future.
     pub async fn dispatch<TInput>(&self, payload: TInput) -> Result<String, RequestError>
@@ -99,7 +107,6 @@ impl Caller {
 
 /// Builder returned by `Caller::send` that lets each request override defaults
 /// before actually enqueuing work in Mongo.
-#[derive(Debug)]
 pub struct SendBuilder<TOutput>
 where
     TOutput: DeserializeOwned + Send + Unpin + 'static,
@@ -110,9 +117,32 @@ where
     timeout: Option<Duration>,
     worker_switch_timeout: Option<Duration>,
     idempotency_key: Option<String>,
+    #[cfg(feature = "tracing")]
     trace_context: Option<TraceContext>,
+    #[cfg(not(feature = "tracing"))]
+    trace_context: Option<()>,
     future: Option<SendFuture<TOutput>>,
     _marker: std::marker::PhantomData<TOutput>,
+}
+
+impl<TOutput> std::fmt::Debug for SendBuilder<TOutput>
+where
+    TOutput: DeserializeOwned + Send + Unpin + 'static,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("SendBuilder");
+        d.field("caller", &self.caller)
+            .field("payload", &self.payload)
+            .field("payload_err", &self.payload_err)
+            .field("timeout", &self.timeout)
+            .field("worker_switch_timeout", &self.worker_switch_timeout)
+            .field("idempotency_key", &self.idempotency_key);
+        #[cfg(feature = "tracing")]
+        d.field("trace_context", &self.trace_context);
+        d.field("future", &self.future.as_ref().map(|_| "..."))
+            .field("_marker", &self._marker)
+            .finish()
+    }
 }
 
 impl<TOutput> SendBuilder<TOutput>
@@ -141,12 +171,13 @@ where
 
     /// Override the captured tracing metadata. Most callers can skip this and let
     /// `TraceContext::capture_current` run automatically.
+    #[cfg(feature = "tracing")]
     pub fn with_trace_context(mut self, trace: TraceContext) -> Self {
         self.trace_context = Some(trace);
         self
     }
 
-    #[tracing::instrument(skip(self))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip(self)))]
     /// Only insert the Mongo document and return the resulting `task_id`.
     pub async fn enqueue_only(self) -> Result<String, RequestError> {
         let SendBuilder {
@@ -174,7 +205,7 @@ where
         .await
     }
 
-    #[tracing::instrument(skip(self))]
+    #[cfg_attr(feature = "tracing", tracing::instrument(skip(self)))]
     fn build_future(&mut self) -> Result<SendFuture<TOutput>, RequestError> {
         if let Some(err) = self.payload_err.take() {
             return Err(err);
@@ -231,15 +262,22 @@ where
     }
 }
 
-#[tracing::instrument(skip(caller, payload), fields(task_id))]
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(skip(caller, payload), fields(task_id))
+)]
 async fn upsert_task(
     caller: &Caller,
     payload: Bson,
     worker_switch_timeout: Duration,
     idempotency_key: Option<String>,
-    trace_context: Option<TraceContext>,
+    #[cfg(feature = "tracing")] trace_context: Option<TraceContext>,
+    #[cfg(not(feature = "tracing"))]
+    #[allow(unused_variables)]
+    trace_context: Option<()>,
 ) -> Result<String, RequestError> {
     let task_id = idempotency_key.unwrap_or_else(|| Uuid::new_v4().to_string());
+    #[cfg(feature = "tracing")]
     tracing::Span::current().record("task_id", &task_id);
     let now = DateTime::now();
 
@@ -267,6 +305,8 @@ async fn upsert_task(
         "updated_at": now,
         "worker_switch_timeout": worker_switch_timeout.as_millis() as i64,
     };
+
+    #[cfg(feature = "tracing")]
     let trace_bson = trace_context
         .and_then(|trace| {
             mongodb::bson::to_bson(&trace)
@@ -277,6 +317,10 @@ async fn upsert_task(
                 .ok()
         })
         .unwrap_or(Bson::Null);
+
+    #[cfg(not(feature = "tracing"))]
+    let trace_bson = Bson::Null;
+
     set_fields.insert("trace_context", trace_bson);
 
     let update = doc! {
@@ -416,4 +460,3 @@ where
 
     Ok(None)
 }
-

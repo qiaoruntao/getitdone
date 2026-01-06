@@ -82,4 +82,3 @@ impl TraceContext {
         TraceFlags::SAMPLED.to_u8()
     }
 }
-

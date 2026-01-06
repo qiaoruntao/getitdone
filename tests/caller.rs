@@ -30,7 +30,7 @@ fn mongo_uri() -> String {
 async fn test_config() -> Config {
     let collection = format!("caller_tests_{}", Uuid::new_v4());
     Config::builder()
-        .mongo_uri(&mongo_uri())
+        .mongo_uri(mongo_uri())
         .database("getitdone_caller_tests")
         .collection(&collection)
         .request_timeout(None)
@@ -59,9 +59,7 @@ async fn drop_collection(config: &Config) {
 async fn send_returns_payload_format_error_for_bad_payload() {
     let config = test_config().await;
     if !mongo_available(&config).await {
-        eprintln!(
-            "skipping send_returns_payload_format_error_for_bad_payload (Mongo unavailable)"
-        );
+        eprintln!("skipping send_returns_payload_format_error_for_bad_payload (Mongo unavailable)");
         return;
     }
     let caller = Caller::connect(config.clone()).await.unwrap();
@@ -81,8 +79,7 @@ async fn builder_overrides_are_persisted() {
         return;
     }
     let caller = Caller::connect(config.clone()).await.unwrap();
-    let trace =
-        TraceContext::from_parts("00112233445566778899aabbccddeeff", "0011223344556677");
+    let trace = TraceContext::from_parts("00112233445566778899aabbccddeeff", "0011223344556677");
 
     let task_id = caller
         .send::<DummyPayload, TestOutput>(DummyPayload {
@@ -115,9 +112,7 @@ async fn builder_overrides_are_persisted() {
 async fn inspect_task_handles_success_failure_and_missing() {
     let config = test_config().await;
     if !mongo_available(&config).await {
-        eprintln!(
-            "skipping inspect_task_handles_success_failure_and_missing (Mongo unavailable)"
-        );
+        eprintln!("skipping inspect_task_handles_success_failure_and_missing (Mongo unavailable)");
         return;
     }
     let caller = Caller::connect(config.clone()).await.unwrap();

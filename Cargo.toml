@@ -2,7 +2,6 @@
 name = "getitdone"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
 authors = ["Qiao Runtao <qiaoruntao@example.com>"]
 description = "Experimenting with a simple Mongo-backed caller/worker bridge that keeps tracing context alive."
 license = "MIT"
@@ -13,6 +12,18 @@ documentation = "https://docs.rs/getitdone"
 keywords = ["mongodb", "worker", "async", "tracing"]
 categories = ["asynchronous", "database", "concurrency"]
 include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE*", "examples/**/*.rs"]
+
+[features]
+default = ["tracing"]
+tracing = [
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:tracing-opentelemetry",
+    "dep:opentelemetry-stdout",
+    "dep:opentelemetry-otlp"
+]
 
 [dependencies]
 # Core
@@ -28,15 +39,14 @@ bson = "2"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 
-# Tracing & OpenTelemetry
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-tracing-opentelemetry = "0.32"
-opentelemetry-stdout = "0.31"
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
-init-tracing-opentelemetry = { version = "0.34", features = ["otlp", "tonic", "tracing_subscriber_ext"] }
+# Optional Tracing & OpenTelemetry
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"], optional = true }
+opentelemetry = { version = "0.31", optional = true }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"], optional = true }
+tracing-opentelemetry = { version = "0.32", optional = true }
+opentelemetry-stdout = { version = "0.31", optional = true }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"], optional = true }
 
 [dev-dependencies]
 # Tests are located in tests/ directory

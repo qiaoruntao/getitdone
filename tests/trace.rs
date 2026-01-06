@@ -1,3 +1,4 @@
+#![cfg(feature = "tracing")]
 use getitdone::TraceContext;
 use opentelemetry::trace::{SpanContext, SpanId, TraceFlags, TraceId, TraceState};
 

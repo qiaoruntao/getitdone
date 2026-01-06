@@ -19,13 +19,16 @@ use serde::de::DeserializeOwned;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{self, Duration as TokioDuration, MissedTickBehavior};
+#[cfg(feature = "tracing")]
 use tracing::{error, info, warn};
+#[cfg(feature = "tracing")]
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
 use crate::config::Config;
 use crate::error::RequestError;
 use crate::storage::connect_collection;
+#[cfg(feature = "tracing")]
 use crate::trace::TraceContext;
 
 const DEFAULT_MAX_INFLIGHT: usize = 32;
@@ -45,7 +48,10 @@ pub struct Worker {
 #[derive(Debug)]
 pub struct WorkerJob<TInput> {
     pub task_id: String,
+    #[cfg(feature = "tracing")]
     pub trace_context: Option<TraceContext>,
+    #[cfg(not(feature = "tracing"))]
+    pub trace_context: Option<()>,
     pub payload: TInput,
 }
 
@@ -98,7 +104,10 @@ impl Worker {
     }
 }
 
-#[tracing::instrument(skip(collection, stop_rx, handler))]
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(skip(collection, stop_rx, handler))
+)]
 async fn worker_loop<TInput, TOutput>(
     collection: Collection<Document>,
     mut stop_rx: oneshot::Receiver<()>,
@@ -116,6 +125,7 @@ where
     let mut change_stream = match open_change_stream(&collection).await {
         Ok(stream) => stream,
         Err(err) => {
+            #[cfg(feature = "tracing")]
             error!(error=%err, "change streams unavailable; worker exiting");
             return Err(err);
         }
@@ -136,6 +146,7 @@ where
             change_stream = match open_change_stream(&collection).await {
                 Ok(stream) => stream,
                 Err(err) => {
+                    #[cfg(feature = "tracing")]
                     error!(error=%err, "change streams unavailable; worker exiting");
                     return Err(err);
                 }
@@ -160,8 +171,14 @@ where
             Some(result) = join_set.join_next(), if !join_set.is_empty() => {
                 match result {
                     Ok(Ok(())) => {}
-                    Ok(Err(e)) => error!(error=%e, "worker task error"),
-                    Err(e) => error!(error=%e, "worker task panicked"),
+                    Ok(Err(_e)) => {
+                        #[cfg(feature = "tracing")]
+                        error!(error=%_e, "worker task error");
+                    }
+                    Err(_e) => {
+                        #[cfg(feature = "tracing")]
+                        error!(error=%_e, "worker task panicked");
+                    }
                 }
             }
             event = change_future => {
@@ -176,11 +193,13 @@ where
                             &mut join_set,
                         ).await;
                     }
-                    Some(Err(e)) => {
-                        warn!(error=%e, "change stream error, will restart");
+                    Some(Err(_e)) => {
+                        #[cfg(feature = "tracing")]
+                        warn!(error=%_e, "change stream error, will restart");
                         change_stream = None;
                     }
                     None => {
+                        #[cfg(feature = "tracing")]
                         warn!("change stream closed, will restart");
                         change_stream = None;
                     }
@@ -192,8 +211,14 @@ where
     while let Some(result) = join_set.join_next().await {
         match result {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => error!(error=%e, "worker task error"),
-            Err(e) => error!(error=%e, "worker task panicked"),
+            Ok(Err(_e)) => {
+                #[cfg(feature = "tracing")]
+                error!(error=%_e, "worker task error");
+            }
+            Err(_e) => {
+                #[cfg(feature = "tracing")]
+                error!(error=%_e, "worker task panicked");
+            }
         }
     }
     Ok(())
@@ -216,7 +241,7 @@ fn is_change_stream_unsupported(error: &mongodb::error::Error) -> bool {
     }
 }
 
-#[tracing::instrument(skip(collection))]
+#[cfg_attr(feature = "tracing", tracing::instrument(skip(collection)))]
 async fn claim_next_task(
     collection: &Collection<Document>,
     worker_id: &str,
@@ -278,13 +303,17 @@ async fn open_change_stream(
                         .into(),
                 ));
             }
+            #[cfg(feature = "tracing")]
             warn!(error=%e, "failed to open change stream");
             Ok(None)
         }
     }
 }
 
-#[tracing::instrument(skip(collection, semaphore, handler, join_set))]
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(skip(collection, semaphore, handler, join_set))
+)]
 async fn pump_available_tasks<TInput, TOutput>(
     collection: &Collection<Document>,
     worker_id: &str,
@@ -302,6 +331,7 @@ async fn pump_available_tasks<TInput, TOutput>(
         };
         match claim_next_task(collection, worker_id, worker_switch_timeout).await {
             Ok(Some(task)) => {
+                #[cfg(feature = "tracing")]
                 if let Ok(id) = task.get_str("task_id") {
                     info!(%worker_id, task_id=%id, "claimed task");
                 }
@@ -319,8 +349,9 @@ async fn pump_available_tasks<TInput, TOutput>(
                 drop(permit);
                 break;
             }
-            Err(e) => {
-                error!(error=%e, "failed to claim task");
+            Err(_e) => {
+                #[cfg(feature = "tracing")]
+                error!(error=%_e, "failed to claim task");
                 drop(permit);
                 break;
             }
@@ -328,9 +359,12 @@ async fn pump_available_tasks<TInput, TOutput>(
     }
 }
 
-#[tracing::instrument(
-    skip(collection, doc, handler, permit),
-    fields(task_id, worker_id, trace_id)
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+        skip(collection, doc, handler, permit),
+        fields(task_id, worker_id, trace_id)
+    )
 )]
 async fn process_task<TInput, TOutput>(
     collection: Collection<Document>,
@@ -345,6 +379,7 @@ where
     TOutput: Serialize + Send + Sync + 'static,
 {
     let _permit = permit;
+    #[cfg(feature = "tracing")]
     tracing::Span::current().record("worker_id", &worker_id);
 
     let task_id = match doc
@@ -354,9 +389,15 @@ where
         Ok(id) => id.to_string(),
         Err(e) => return Err(e), // Can't mark failed without ID
     };
+    #[cfg(feature = "tracing")]
     tracing::Span::current().record("task_id", &task_id);
 
-    let setup_result: Result<(TInput, Option<TraceContext>), RequestError> = (|| async {
+    #[cfg(feature = "tracing")]
+    type SetupResult<T> = Result<(T, Option<TraceContext>), RequestError>;
+    #[cfg(not(feature = "tracing"))]
+    type SetupResult<T> = Result<(T, Option<()>), RequestError>;
+
+    let setup_result: SetupResult<TInput> = async {
         let payload_bson = doc
             .get("task_input")
             .ok_or(RequestError::PayloadFormat {
@@ -367,7 +408,8 @@ where
             mongodb::bson::from_bson(payload_bson).map_err(|_| RequestError::PayloadFormat {
                 field: "task_input",
             })?;
-            
+
+        #[cfg(feature = "tracing")]
         let trace_context = doc.get("trace_context").and_then(|raw| {
             if raw == &Bson::Null {
                 return None;
@@ -376,13 +418,16 @@ where
             tracing::Span::current().record("trace_id", ctx.trace_id.as_str());
             Some(ctx)
         });
+        #[cfg(not(feature = "tracing"))]
+        let trace_context = None;
 
         if !heartbeat(&collection, &task_id, &worker_id).await? {
+            #[cfg(feature = "tracing")]
             error!(%worker_id, %task_id, "lost ownership before handler start");
             return Err(RequestError::WorkerGone);
         }
         Ok((payload, trace_context))
-    })()
+    }
     .await;
 
     let (payload, trace_context) = match setup_result {
@@ -412,15 +457,14 @@ where
         hb_stop_rx,
     );
 
-    // Create a handler span to measure business logic duration
-    // Use span link to connect this worker trace to the caller's trace
+    #[cfg(feature = "tracing")]
     let handler_span = tracing::info_span!(
         "worker.handler",
         %task_id,
         %worker_id,
     );
 
-    // Add a span link to the caller's trace context if available
+    #[cfg(feature = "tracing")]
     if let Some(ref caller_context) = trace_context {
         if let Some(span_context) = caller_context.to_span_context() {
             handler_span.add_link(span_context);
@@ -435,10 +479,14 @@ where
         }
     }
 
+    #[cfg(feature = "tracing")]
     let handler_result = {
         let _guard = handler_span.enter();
         handler(job).await
     };
+    #[cfg(not(feature = "tracing"))]
+    let handler_result = handler(job).await;
+
     let _ = hb_stop_tx.send(());
     match handler_result {
         Ok(output) => {
@@ -463,9 +511,11 @@ where
                 .await
                 .map_err(|e| RequestError::Database(e.to_string()))?;
             if result.matched_count == 0 {
+                #[cfg(feature = "tracing")]
                 error!(%worker_id, %task_id, "lost ownership before completing");
                 return Err(RequestError::WorkerGone);
             }
+            #[cfg(feature = "tracing")]
             info!(%worker_id, %task_id, "completed task");
             Ok(())
         }
@@ -476,7 +526,7 @@ where
     }
 }
 
-#[tracing::instrument(skip(collection))]
+#[cfg_attr(feature = "tracing", tracing::instrument(skip(collection)))]
 async fn mark_task_failed(collection: &Collection<Document>, task_id: &str, reason: &str) {
     let update = doc! {
         "$set": {
@@ -486,15 +536,16 @@ async fn mark_task_failed(collection: &Collection<Document>, task_id: &str, reas
             "worker_state.finished_at": DateTime::now(),
         }
     };
-    if let Err(e) = collection
+    if let Err(_e) = collection
         .update_one(doc! {"task_id": task_id}, update, None)
         .await
     {
-        error!(task_id=%task_id, error=%e, "failed to mark task as failed");
+        #[cfg(feature = "tracing")]
+        error!(task_id=%task_id, error=%_e, "failed to mark task as failed");
     }
 }
 
-#[tracing::instrument(skip(collection))]
+#[cfg_attr(feature = "tracing", tracing::instrument(skip(collection)))]
 async fn heartbeat(
     collection: &Collection<Document>,
     task_id: &str,
@@ -532,8 +583,9 @@ fn start_heartbeat_loop(
                     break;
                 }
                 _ = ticker.tick() => {
-                    if let Err(e) = heartbeat(&collection, &task_id, &worker_id).await {
-                        error!(%worker_id, %task_id, error=%e, "heartbeat failed");
+                    if let Err(_e) = heartbeat(&collection, &task_id, &worker_id).await {
+                        #[cfg(feature = "tracing")]
+                        error!(%worker_id, %task_id, error=%_e, "heartbeat failed");
                         break;
                     }
                 }
@@ -544,10 +596,18 @@ fn start_heartbeat_loop(
 
 /// Guard returned by `Worker::run` so callers can trigger graceful shutdowns
 /// (and automatically abort the worker task on drop).
-#[derive(Debug)]
 pub struct WorkerHandle {
     stop_signal: Option<oneshot::Sender<()>>,
     join_handle: Option<JoinHandle<Result<(), RequestError>>>,
+}
+
+impl std::fmt::Debug for WorkerHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerHandle")
+            .field("stop_signal", &self.stop_signal)
+            .field("join_handle", &self.join_handle.as_ref().map(|_| "..."))
+            .finish()
+    }
 }
 
 impl WorkerHandle {

@@ -1,3 +1,4 @@
 /target
 /.idea
 /htmlReport/
+Cargo.lock

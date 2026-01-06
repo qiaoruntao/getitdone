@@ -1,13 +1,9 @@
-use getitdone::{init_test_tracing, TestTracingGuard};
+#![cfg(feature = "tracing")]
+use getitdone::init_test_tracing;
 
 #[test]
-fn stdout_initializer_smoke_test() {
-    match init_test_tracing("getitdone-tests", None) {
-        Ok(TestTracingGuard::Stdout(provider)) => {
-            let _ = provider.force_flush();
-            let _ = provider.shutdown();
-        }
-        Ok(TestTracingGuard::Otlp(_)) => panic!("expected stdout tracing"),
-        Err(e) => panic!("failed to init tracing: {e}"),
-    }
+fn tracing_initializer_smoke_test() {
+    // We just want to ensure it doesn't panic and returns a guard
+    let guard = init_test_tracing("getitdone-tests", None);
+    assert!(guard.is_ok());
 }
