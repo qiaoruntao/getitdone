@@ -17,7 +17,7 @@ impl Config {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct ConfigBuilder {
     mongo_uri: Option<String>,
     database: Option<String>,

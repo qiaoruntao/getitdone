@@ -7,7 +7,7 @@ mod worker;
 
 
 
-pub use caller::{Caller, SendBuilder};
+pub use caller::{Caller, SendBuilder, inspect_task};
 pub use config::{Config, ConfigBuilder};
 pub use error::RequestError;
 pub use trace::TraceContext;
@@ -86,22 +86,9 @@ fn init_stdout_tracing(
 }
 
 /// Guard returned by [`init_test_tracing`] so exporters live long enough to flush.
+#[derive(Debug)]
 pub enum TestTracingGuard {
     Otlp(init_tracing_opentelemetry::Guard),
     Stdout(opentelemetry_sdk::trace::SdkTracerProvider),
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn stdout_initializer_smoke_test() {
-        match crate::init_test_tracing("getitdone-tests", None) {
-            Ok(super::TestTracingGuard::Stdout(provider)) => {
-                let _ = provider.force_flush();
-                let _ = provider.shutdown();
-            }
-            Ok(super::TestTracingGuard::Otlp(_)) => panic!("expected stdout tracing"),
-            Err(e) => panic!("failed to init tracing: {e}"),
-        }
-    }
-}

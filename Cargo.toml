@@ -2,24 +2,52 @@
 name = "getitdone"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+authors = ["Qiao Runtao <qiaoruntao@example.com>"]
+description = "Experimenting with a simple Mongo-backed caller/worker bridge that keeps tracing context alive."
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/qiaoruntao/getitdone"
+repository = "https://github.com/qiaoruntao/getitdone"
+documentation = "https://docs.rs/getitdone"
+keywords = ["mongodb", "worker", "async", "tracing"]
+categories = ["asynchronous", "database", "concurrency"]
+include = ["src/**/*.rs", "Cargo.toml", "README.md", "LICENSE*", "examples/**/*.rs"]
 
 [dependencies]
-pin-project-lite = "0.2"
+# Core
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 uuid = { version = "1", features = ["v4"] }
 thiserror = "1"
-mongodb = { version = "2", default-features = false, features = ["tokio-runtime", "zstd-compression", "snappy-compression", "zlib-compression"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-bson = "2"
 futures-util = "0.3"
-hex = "0.4"
+
+# MongoDB & Storage
+mongodb = { version = "2", default-features = false, features = ["tokio-runtime", "zstd-compression", "snappy-compression", "zlib-compression"] }
+bson = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+
+# Tracing & OpenTelemetry
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-opentelemetry = { version = "0.31" }
+opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 tracing-opentelemetry = "0.32"
-opentelemetry-stdout = { version = "0.31" }
-tracing-opentelemetry-instrumentation-sdk = "0.32"
-init-tracing-opentelemetry = { version = "0.34", features = ["otlp", "tonic", "metrics", "tracing_subscriber_ext"] }
-opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "logs", "metrics"] }
+opentelemetry-stdout = "0.31"
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }
+init-tracing-opentelemetry = { version = "0.34", features = ["otlp", "tonic", "tracing_subscriber_ext"] }
+
+[dev-dependencies]
+# Tests are located in tests/ directory
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+unused_must_use = "warn"
+missing_debug_implementations = "warn"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

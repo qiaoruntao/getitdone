@@ -16,7 +16,6 @@ use mongodb::options::{
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::Value;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{self, Duration as TokioDuration, MissedTickBehavior};
@@ -33,6 +32,7 @@ const DEFAULT_MAX_INFLIGHT: usize = 32;
 
 /// Long-lived component that keeps reading the configured Mongo collection,
 /// claims pending tasks, and executes user logic for each `TaskInput`.
+#[derive(Debug)]
 pub struct Worker {
     config: Config,
     collection: Collection<Document>,
@@ -42,6 +42,7 @@ pub struct Worker {
 
 /// Wrapper passed to user handlers containing the task id (which doubles as the
 /// idempotency key), the optional caller `TraceContext`, and the typed payload.
+#[derive(Debug)]
 pub struct WorkerJob<TInput> {
     pub task_id: String,
     pub trace_context: Option<TraceContext>,
@@ -362,12 +363,8 @@ where
                 field: "task_input",
             })?
             .clone();
-        let payload_value: Value =
-            mongodb::bson::from_bson(payload_bson).map_err(|_| RequestError::PayloadFormat {
-                field: "task_input",
-            })?;
         let payload: TInput =
-            serde_json::from_value(payload_value).map_err(|_| RequestError::PayloadFormat {
+            mongodb::bson::from_bson(payload_bson).map_err(|_| RequestError::PayloadFormat {
                 field: "task_input",
             })?;
             
@@ -547,6 +544,7 @@ fn start_heartbeat_loop(
 
 /// Guard returned by `Worker::run` so callers can trigger graceful shutdowns
 /// (and automatically abort the worker task on drop).
+#[derive(Debug)]
 pub struct WorkerHandle {
     stop_signal: Option<oneshot::Sender<()>>,
     join_handle: Option<JoinHandle<Result<(), RequestError>>>,

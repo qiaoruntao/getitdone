@@ -495,21 +495,17 @@ version = "0.1.0"
 dependencies = [
  "bson",
  "futures-util",
- "hex",
  "init-tracing-opentelemetry",
  "mongodb",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-stdout",
  "opentelemetry_sdk",
- "pin-project-lite",
  "serde",
- "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-opentelemetry",
- "tracing-opentelemetry-instrumentation-sdk",
  "tracing-subscriber",
  "uuid",
 ]
@@ -864,7 +860,6 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
- "opentelemetry-stdout",
  "opentelemetry_sdk",
  "thiserror 2.0.17",
  "tonic",
@@ -2362,18 +2357,6 @@ dependencies = [
  "tracing-log",
  "tracing-subscriber",
  "web-time",
-]
-
-[[package]]
-name = "tracing-opentelemetry-instrumentation-sdk"
-version = "0.32.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4aea2e5bee9df9d098d951baeccb84e614f12cbc74d01d99fb3ac99a55bf7bf7"
-dependencies = [
- "opentelemetry",
- "opentelemetry-semantic-conventions",
- "tracing",
- "tracing-opentelemetry",
 ]
 
 [[package]]
