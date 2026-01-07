@@ -2,16 +2,44 @@ use std::time::Duration;
 
 use getitdone::{Caller, Config, RequestError, TraceContext, Worker, WorkerJob};
 use mongodb::{
+    bson::{doc, Document},
     Client, Collection,
-    bson::{Document, doc},
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::OnceCell;
 use uuid::Uuid;
 
+const MONGO_URI: &str = "mongodb://localhost:27017";
+
+static CLEANUP_DONE: OnceCell<()> = OnceCell::const_new();
+
+async fn global_cleanup() {
+    let client = Client::with_uri_str(MONGO_URI)
+        .await
+        .expect("failed to connect for global cleanup");
+    let database = client.database("getitdone_test");
+    let collections = database
+        .list_collection_names()
+        .await
+        .expect("failed to list collections");
+
+    for collection_name in collections {
+        if collection_name.starts_with("test_tasks_") {
+            database
+                .collection::<Document>(&collection_name)
+                .drop()
+                .await
+                .expect("failed to drop collection");
+        }
+    }
+}
+
 async fn test_config() -> Config {
+    CLEANUP_DONE.get_or_init(global_cleanup).await;
+
     let collection_name = format!("test_tasks_{}", Uuid::new_v4());
     let config = Config::builder()
-        .mongo_uri("mongodb://localhost:27017")
+        .mongo_uri(MONGO_URI)
         .database("getitdone_test")
         .collection(&collection_name)
         .worker_switch_timeout(Duration::from_secs(2)) // Fast switch for tests
@@ -304,7 +332,7 @@ async fn test_reset_finished_tasks() {
     config.allow_reset_finished_tasks = true;
     // note: `ConfigBuilder` has `reset_finished_tasks` helper.
     let config_built = Config::builder()
-        .mongo_uri("mongodb://localhost:27017")
+        .mongo_uri(MONGO_URI)
         .database("getitdone_test")
         .collection(&config.collection)
         .reset_finished_tasks(true)
@@ -418,4 +446,78 @@ async fn test_worker_links_custom_trace_context() {
     assert_eq!(received.span_id, custom_trace.span_id);
 
     handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_worker_task_counts() {
+    let config = test_config().await;
+
+    // Use channels to coordinate task start/stop
+    let (start_tx, mut start_rx) = tokio::sync::mpsc::channel::<String>(4);
+    let (stop_tx, stop_rx) = tokio::sync::mpsc::channel::<String>(4);
+    let stop_rx = std::sync::Arc::new(tokio::sync::Mutex::new(stop_rx));
+
+    // Start Worker with a small inflight limit
+    let worker = Worker::connect(config.clone())
+        .await
+        .unwrap()
+        .with_max_inflight(4);
+
+    let worker_handle = worker.run({
+        let start_tx = start_tx.clone();
+        let stop_rx = stop_rx.clone();
+        move |job: WorkerJob<EchoInput>| {
+            let start_tx = start_tx.clone();
+            let stop_rx = stop_rx.clone();
+            async move {
+                // Signal that we've started this task
+                start_tx.send(job.payload.msg.clone()).await.unwrap();
+
+                // Wait for the signal to stop
+                let stop_msg = stop_rx.lock().await.recv().await.unwrap();
+                assert_eq!(job.payload.msg, stop_msg); // Ensure we stop the correct task
+
+                Ok(EchoOutput { msg: "done".into() })
+            }
+        }
+    });
+
+    assert_eq!(worker_handle.get_max_inflight(), 4);
+    assert_eq!(worker_handle.get_running_task_cnt(), 0);
+
+    let caller = Caller::connect(config.clone()).await.unwrap();
+
+    // --- Task 1 ---
+    caller
+        .dispatch(EchoInput { msg: "task1".into() })
+        .await
+        .unwrap();
+
+    // Wait for worker to pick it up
+    assert_eq!(start_rx.recv().await.unwrap(), "task1");
+    // Allow some time for the semaphore to be acquired, as it happens before the handler starts
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(worker_handle.get_running_task_cnt(), 1);
+
+    // --- Task 2 ---
+    caller
+        .dispatch(EchoInput { msg: "task2".into() })
+        .await
+        .unwrap();
+    assert_eq!(start_rx.recv().await.unwrap(), "task2");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(worker_handle.get_running_task_cnt(), 2);
+
+    // --- Complete Task 1 ---
+    stop_tx.send("task1".into()).await.unwrap();
+    // A short sleep to allow the task to finish and release the semaphore
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(worker_handle.get_running_task_cnt(), 1);
+
+    // --- Complete Task 2 ---
+    stop_tx.send("task2".into()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(worker_handle.get_running_task_cnt(), 0);
+
+    worker_handle.shutdown().await;
 }

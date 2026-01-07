@@ -29,7 +29,7 @@ use crate::storage::connect_collection;
 #[cfg(feature = "tracing")]
 use crate::trace::TraceContext;
 
-const DEFAULT_MAX_INFLIGHT: usize = 32;
+const DEFAULT_MAX_INFLIGHT: usize = 10000;
 
 /// Long-lived component that keeps reading the configured Mongo collection,
 /// claims pending tasks, and executes user logic for each `TaskInput`.
@@ -66,6 +66,13 @@ impl Worker {
         })
     }
 
+    /// Override the number of concurrent tasks this worker will execute. The
+    /// default is 32.
+    pub fn with_max_inflight(mut self, n: usize) -> Self {
+        self.max_inflight = n;
+        self
+    }
+
     /// Starts the background loop with the provided async handler. Each task is
     /// executed in its own Tokio task up to `max_inflight`.
     pub fn run<TInput, TOutput, H, Fut>(self, handler: H) -> WorkerHandle
@@ -87,24 +94,28 @@ impl Worker {
                 handler(job).boxed()
             },
         );
+        let semaphore = Arc::new(Semaphore::new(max_inflight));
         let join_handle = tokio::spawn(worker_loop(
             collection,
             stop_rx,
             config.worker_switch_timeout,
             worker_id,
             max_inflight,
+            semaphore.clone(),
             handler,
         ));
         WorkerHandle {
             stop_signal: Some(stop_tx),
             join_handle: Some(join_handle),
+            max_inflight,
+            task_semaphore: semaphore,
         }
     }
 }
 
 #[cfg_attr(
     feature = "tracing",
-    tracing::instrument(skip(collection, stop_rx, handler))
+    tracing::instrument(skip(collection, stop_rx, semaphore, handler))
 )]
 async fn worker_loop<TInput, TOutput>(
     collection: Collection<Document>,
@@ -112,13 +123,13 @@ async fn worker_loop<TInput, TOutput>(
     worker_switch_timeout: Duration,
     worker_id: String,
     max_inflight: usize,
+    semaphore: Arc<Semaphore>,
     handler: WorkerHandler<TInput, TOutput>,
 ) -> Result<(), RequestError>
 where
     TInput: DeserializeOwned + Send + 'static,
     TOutput: Serialize + Send + Sync + 'static,
 {
-    let semaphore = Arc::new(Semaphore::new(max_inflight));
     let mut join_set = JoinSet::new();
     let mut change_stream = match open_change_stream(&collection).await {
         Ok(stream) => stream,
@@ -598,6 +609,8 @@ fn start_heartbeat_loop(
 pub struct WorkerHandle {
     stop_signal: Option<oneshot::Sender<()>>,
     join_handle: Option<JoinHandle<Result<(), RequestError>>>,
+    max_inflight: usize,
+    task_semaphore: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for WorkerHandle {
@@ -605,6 +618,8 @@ impl std::fmt::Debug for WorkerHandle {
         f.debug_struct("WorkerHandle")
             .field("stop_signal", &self.stop_signal)
             .field("join_handle", &self.join_handle.as_ref().map(|_| "..."))
+            .field("max_inflight", &self.max_inflight)
+            .field("task_semaphore", &self.task_semaphore.available_permits())
             .finish()
     }
 }
@@ -623,13 +638,20 @@ impl WorkerHandle {
     /// Await the worker without sending a stop signal. Useful for detecting early exits.
     pub async fn wait(mut self) -> Result<(), RequestError> {
         if let Some(handle) = self.join_handle.take() {
-            match handle.await {
-                Ok(result) => result,
-                Err(_) => Err(RequestError::WorkerGone),
-            }
+            handle.await.unwrap_or_else(|_| Err(RequestError::WorkerGone))
         } else {
             Ok(())
         }
+    }
+
+    /// Get the current count of running tasks.
+    pub fn get_running_task_cnt(&self) -> usize {
+        self.max_inflight - self.task_semaphore.available_permits()
+    }
+
+    /// Get the maximum number of inflight tasks.
+    pub fn get_max_inflight(&self) -> usize {
+        self.max_inflight
     }
 }
 
