@@ -2,3 +2,5 @@
 /.idea
 /htmlReport/
 Cargo.lock
+tests/mock_e2e/Cargo.lock
+tests/mock_e2e/target/

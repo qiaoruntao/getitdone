@@ -479,8 +479,8 @@ where
             handler_span.add_link(span_context);
             info!(
                 %task_id,
-                trace_id = %caller_context.trace_id,
-                span_id = %caller_context.span_id,
+                target_trace_id = %caller_context.trace_id,
+                target_span_id = %caller_context.span_id,
                 "linked worker span to caller span"
             );
         } else {

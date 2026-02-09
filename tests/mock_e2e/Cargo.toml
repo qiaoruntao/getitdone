@@ -1,0 +1,28 @@
+[package]
+name = "getitdone-mock-e2e"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "mock_worker"
+path = "src/mock_worker.rs"
+
+[[bin]]
+name = "mock_caller"
+path = "src/mock_caller.rs"
+
+[dependencies]
+getitdone = { path = "../..", features = ["tracing"] }
+qrt-log-utils = { path = "../../../qrt-log-utils" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+
+tracing = "0.1"
+
+# Hard-pin these to match qrt-log-utils so getitdone's tracing context capture
+# (`Span::current().context()`) doesn't end up with two incompatible versions.
+opentelemetry = "=0.28.0"
+tracing-opentelemetry = "=0.29.0"
