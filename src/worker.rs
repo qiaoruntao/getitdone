@@ -13,9 +13,7 @@ use mongodb::change_stream::{ChangeStream, event::ChangeStreamEvent};
 use mongodb::error::{CommandError, ErrorKind};
 use mongodb::options::{FullDocumentType, ReturnDocument};
 #[cfg(feature = "tracing")]
-use opentelemetry::{Context as OtelContext};
-#[cfg(feature = "tracing")]
-use opentelemetry::trace::TraceContextExt as _;
+use opentelemetry as _;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
@@ -480,15 +478,12 @@ where
     #[cfg(feature = "tracing")]
     if let Some(ref caller_context) = trace_context {
         if let Some(span_context) = caller_context.to_span_context() {
-            // Prefer a real parent/child relationship for UX and queryability.
-            // Many backends don't surface OTel span links well, but will always show parenting.
-            handler_span.set_parent(OtelContext::new().with_remote_span_context(span_context.clone()));
             handler_span.add_link(span_context);
             info!(
                 %task_id,
                 target_trace_id = %caller_context.trace_id,
                 target_span_id = %caller_context.span_id,
-                "attached caller span context (parent + link)"
+                "linked worker span to caller span"
             );
         } else {
             warn!(%task_id, "trace context present but invalid");
