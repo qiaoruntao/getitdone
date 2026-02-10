@@ -2,9 +2,9 @@ mod common;
 
 use getitdone::Caller;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tracing::{info, Instrument};
 use uuid::Uuid;
-use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Ping {

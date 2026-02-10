@@ -4,9 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use getitdone::{RequestError, Worker, WorkerJob};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use tokio::sync::oneshot;
 use tracing::{info, instrument, Instrument};
-use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Ping {
