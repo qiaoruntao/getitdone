@@ -29,17 +29,9 @@ pub fn build_config(collection: &str) -> Config {
 pub fn init_tracing(service_name: &'static str) -> LoggerContext {
     let endpoint = env("OTEL_EXPORTER_OTLP_ENDPOINT", DEFAULT_OTLP_ENDPOINT);
 
-    let disable_whitelist = std::env::var("QRT_LOG_UTILS_DISABLE_WHITELIST")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-
-    let mut builder = LoggerConfig::builder().endpoint(endpoint);
-    if !disable_whitelist {
-        // Match tg_endpoint/download: only emit spans/logs from this binary + getitdone.
-        builder = builder
-            .add_whitelist_crate(service_name)
-            .add_whitelist_crate("getitdone");
-    }
+    let builder = LoggerConfig::builder()
+        .endpoint(endpoint)
+        .add_blacklist_crates(["hyper", "tonic", "h2", "reqwest"]);
 
     let logger_config = builder.build();
     init_logger(service_name, logger_config)
