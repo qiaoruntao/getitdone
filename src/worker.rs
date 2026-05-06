@@ -97,6 +97,10 @@ impl Worker {
             },
         );
         let semaphore = Arc::new(Semaphore::new(max_inflight));
+        let stats = WorkerStats {
+            max_inflight,
+            task_semaphore: semaphore.clone(),
+        };
         let join_handle = tokio::spawn(worker_loop(
             collection,
             stop_rx,
@@ -109,8 +113,7 @@ impl Worker {
         WorkerHandle {
             stop_signal: Some(stop_tx),
             join_handle: Some(join_handle),
-            max_inflight,
-            task_semaphore: semaphore,
+            stats,
         }
     }
 }
@@ -611,8 +614,23 @@ fn start_heartbeat_loop(
 pub struct WorkerHandle {
     stop_signal: Option<oneshot::Sender<()>>,
     join_handle: Option<JoinHandle<Result<(), RequestError>>>,
+    stats: WorkerStats,
+}
+
+/// Cheap shared stats view for a running worker.
+#[derive(Clone)]
+pub struct WorkerStats {
     max_inflight: usize,
     task_semaphore: Arc<Semaphore>,
+}
+
+impl std::fmt::Debug for WorkerStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerStats")
+            .field("max_inflight", &self.max_inflight)
+            .field("task_semaphore", &self.task_semaphore.available_permits())
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for WorkerHandle {
@@ -620,13 +638,17 @@ impl std::fmt::Debug for WorkerHandle {
         f.debug_struct("WorkerHandle")
             .field("stop_signal", &self.stop_signal)
             .field("join_handle", &self.join_handle.as_ref().map(|_| "..."))
-            .field("max_inflight", &self.max_inflight)
-            .field("task_semaphore", &self.task_semaphore.available_permits())
+            .field("stats", &self.stats)
             .finish()
     }
 }
 
 impl WorkerHandle {
+    /// Returns a cloneable stats view for metrics and observability.
+    pub fn stats(&self) -> WorkerStats {
+        self.stats.clone()
+    }
+
     /// Ask the worker loop to stop, then await the background task.
     pub async fn shutdown(mut self) {
         if let Some(tx) = self.stop_signal.take() {
@@ -640,12 +662,26 @@ impl WorkerHandle {
     /// Await the worker without sending a stop signal. Useful for detecting early exits.
     pub async fn wait(mut self) -> Result<(), RequestError> {
         if let Some(handle) = self.join_handle.take() {
-            handle.await.unwrap_or_else(|_| Err(RequestError::WorkerGone))
+            handle
+                .await
+                .unwrap_or_else(|_| Err(RequestError::WorkerGone))
         } else {
             Ok(())
         }
     }
 
+    /// Get the current count of running tasks.
+    pub fn get_running_task_cnt(&self) -> usize {
+        self.stats.get_running_task_cnt()
+    }
+
+    /// Get the maximum number of inflight tasks.
+    pub fn get_max_inflight(&self) -> usize {
+        self.stats.get_max_inflight()
+    }
+}
+
+impl WorkerStats {
     /// Get the current count of running tasks.
     pub fn get_running_task_cnt(&self) -> usize {
         self.max_inflight - self.task_semaphore.available_permits()

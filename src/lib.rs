@@ -11,4 +11,4 @@ pub use config::{Config, ConfigBuilder};
 pub use error::RequestError;
 #[cfg(feature = "tracing")]
 pub use trace::TraceContext;
-pub use worker::{Worker, WorkerHandle, WorkerJob};
+pub use worker::{Worker, WorkerHandle, WorkerJob, WorkerStats};
