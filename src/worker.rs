@@ -136,6 +136,8 @@ where
     TOutput: Serialize + Send + Sync + 'static,
 {
     let mut join_set = JoinSet::new();
+    let mut claim_ticker = time::interval(switch_maintenance_interval(worker_switch_timeout));
+    claim_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut change_stream = match open_change_stream(&collection).await {
         Ok(stream) => stream,
         Err(err) => {
@@ -182,6 +184,16 @@ where
             .unwrap_or_else(|| Either::Right(futures_util::future::pending()));
         tokio::select! {
             _ = &mut stop_rx => break,
+            _ = claim_ticker.tick() => {
+                pump_available_tasks(
+                    &collection,
+                    &worker_id,
+                    worker_switch_timeout,
+                    &semaphore,
+                    &handler,
+                    &mut join_set,
+                ).await;
+            }
             Some(result) = join_set.join_next(), if !join_set.is_empty() => {
                 match result {
                     Ok(Ok(())) => {}
@@ -262,12 +274,35 @@ async fn claim_next_task(
     worker_switch_timeout: Duration,
 ) -> Result<Option<Document>, RequestError> {
     let now = DateTime::now();
-    let threshold =
-        DateTime::from_millis(now.timestamp_millis() - worker_switch_timeout.as_millis() as i64);
+    let default_switch_timeout_ms = worker_switch_timeout.as_millis() as i64;
     let filter = doc! {
         "$or": [
             {"status": "pending"},
-            {"status": "running", "worker_state.heartbeat_at": {"$lt": threshold}},
+            {
+                "status": "running",
+                "worker_state.heartbeat_at": {"$type": "date"},
+                "$expr": {
+                    "$lte": [
+                        {
+                            "$add": [
+                                "$worker_state.heartbeat_at",
+                                {
+                                    "$ifNull": [
+                                        "$worker_switch_timeout",
+                                        {
+                                            "$ifNull": [
+                                                "$worker_state.switch_timeout_ms",
+                                                default_switch_timeout_ms,
+                                            ]
+                                        },
+                                    ]
+                                },
+                            ]
+                        },
+                        now,
+                    ]
+                },
+            },
         ]
     };
     let update = doc! {
@@ -462,12 +497,13 @@ where
         trace_context: trace_context.clone(),
         payload,
     };
+    let task_switch_timeout = task_switch_timeout(&doc, worker_switch_timeout);
     let (hb_stop_tx, hb_stop_rx) = oneshot::channel();
     start_heartbeat_loop(
         collection.clone(),
         task_id.clone(),
         worker_id.clone(),
-        worker_switch_timeout,
+        task_switch_timeout,
         hb_stop_rx,
     );
 
@@ -588,9 +624,9 @@ fn start_heartbeat_loop(
     worker_switch_timeout: Duration,
     mut stop_rx: oneshot::Receiver<()>,
 ) {
-    let interval_ms = (worker_switch_timeout.as_millis() / 3).max(500) as u64;
+    let interval = switch_maintenance_interval(worker_switch_timeout);
     tokio::spawn(async move {
-        let mut ticker = time::interval(TokioDuration::from_millis(interval_ms));
+        let mut ticker = time::interval(interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -607,6 +643,26 @@ fn start_heartbeat_loop(
             }
         }
     });
+}
+
+fn task_switch_timeout(doc: &Document, fallback: Duration) -> Duration {
+    doc.get_i64("worker_switch_timeout")
+        .or_else(|_| {
+            doc.get_document("worker_state")
+                .and_then(|worker_state| worker_state.get_i64("switch_timeout_ms"))
+        })
+        .ok()
+        .and_then(|millis| u64::try_from(millis).ok())
+        .map(Duration::from_millis)
+        .unwrap_or(fallback)
+}
+
+fn switch_maintenance_interval(worker_switch_timeout: Duration) -> TokioDuration {
+    let third = worker_switch_timeout / 3;
+    third.clamp(
+        TokioDuration::from_millis(50),
+        TokioDuration::from_millis(500),
+    )
 }
 
 /// Guard returned by `Worker::run` so callers can trigger graceful shutdowns

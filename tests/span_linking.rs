@@ -1,13 +1,13 @@
 #![cfg(feature = "tracing")]
 
+use futures_util::future::BoxFuture;
 use getitdone::TraceContext;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::error::OTelSdkResult;
-use opentelemetry_sdk::trace::{SpanData, SpanExporter, SdkTracerProvider};
+use opentelemetry_sdk::trace::{SdkTracerProvider, SpanData, SpanExporter};
 use std::sync::{Arc, Mutex};
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use tracing_subscriber::prelude::*;
-use futures_util::future::BoxFuture;
 
 #[derive(Clone, Debug, Default)]
 struct CollectingExporter {

@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use getitdone::{Caller, Config, RequestError, TraceContext, Worker, WorkerJob};
 use mongodb::{
-    bson::{doc, Document},
     Client, Collection,
+    bson::{Document, doc},
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::OnceCell;
@@ -227,6 +227,110 @@ async fn test_worker_stealing() {
     // Await result - B should complete it
     let result: EchoOutput = caller.await_response(task_id).await.unwrap();
     assert_eq!(result.msg, "recovered");
+
+    handle_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_running_peer_steals_after_heartbeat_expires_without_new_task() {
+    let mut config = test_config().await;
+    config.worker_switch_timeout = Duration::from_millis(300);
+
+    let (claimed_tx, claimed_rx) = tokio::sync::oneshot::channel::<()>();
+    let claimed_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(claimed_tx)));
+
+    let worker_a = Worker::connect(config.clone()).await.unwrap();
+    let handle_a = worker_a.run({
+        let claimed_tx = claimed_tx.clone();
+        move |_: WorkerJob<EchoInput>| {
+            let claimed_tx = claimed_tx.clone();
+            async move {
+                if let Some(tx) = claimed_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                std::future::pending::<Result<EchoOutput, RequestError>>().await
+            }
+        }
+    });
+
+    let caller = Caller::connect(config.clone()).await.unwrap();
+    let task_id = caller
+        .dispatch(EchoInput {
+            msg: "active-peer-recovery".into(),
+        })
+        .await
+        .unwrap();
+    claimed_rx.await.unwrap();
+
+    let worker_b = Worker::connect(config.clone()).await.unwrap();
+    let handle_b = worker_b.run(|_: WorkerJob<EchoInput>| async move {
+        Ok(EchoOutput {
+            msg: "recovered-by-active-peer".into(),
+        })
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(handle_a);
+
+    let result: EchoOutput =
+        tokio::time::timeout(Duration::from_secs(2), caller.await_response(task_id))
+            .await
+            .expect("active peer did not sweep stale task")
+            .unwrap();
+    assert_eq!(result.msg, "recovered-by-active-peer");
+
+    handle_b.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_task_level_worker_switch_timeout_controls_stealing() {
+    let mut config = test_config().await;
+    config.worker_switch_timeout = Duration::from_secs(2);
+
+    let (claimed_tx, claimed_rx) = tokio::sync::oneshot::channel::<()>();
+    let claimed_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(claimed_tx)));
+
+    let worker_a = Worker::connect(config.clone()).await.unwrap();
+    let handle_a = worker_a.run({
+        let claimed_tx = claimed_tx.clone();
+        move |_: WorkerJob<EchoInput>| {
+            let claimed_tx = claimed_tx.clone();
+            async move {
+                if let Some(tx) = claimed_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                std::future::pending::<Result<EchoOutput, RequestError>>().await
+            }
+        }
+    });
+
+    let caller = Caller::connect(config.clone()).await.unwrap();
+    let task_id = caller
+        .send::<_, EchoOutput>(EchoInput {
+            msg: "task-timeout-recovery".into(),
+        })
+        .with_worker_switch_timeout(Duration::from_millis(250))
+        .enqueue_only()
+        .await
+        .unwrap();
+    claimed_rx.await.unwrap();
+
+    let worker_b = Worker::connect(config.clone()).await.unwrap();
+    let handle_b = worker_b.run(|_: WorkerJob<EchoInput>| async move {
+        Ok(EchoOutput {
+            msg: "recovered-using-task-timeout".into(),
+        })
+    });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(handle_a);
+
+    let result: EchoOutput =
+        tokio::time::timeout(Duration::from_millis(1500), caller.await_response(task_id))
+            .await
+            .expect("task-level switch timeout was not honored")
+            .unwrap();
+    assert_eq!(result.msg, "recovered-using-task-timeout");
 
     handle_b.shutdown().await;
 }
@@ -489,7 +593,9 @@ async fn test_worker_task_counts() {
 
     // --- Task 1 ---
     caller
-        .dispatch(EchoInput { msg: "task1".into() })
+        .dispatch(EchoInput {
+            msg: "task1".into(),
+        })
         .await
         .unwrap();
 
@@ -501,7 +607,9 @@ async fn test_worker_task_counts() {
 
     // --- Task 2 ---
     caller
-        .dispatch(EchoInput { msg: "task2".into() })
+        .dispatch(EchoInput {
+            msg: "task2".into(),
+        })
         .await
         .unwrap();
     assert_eq!(start_rx.recv().await.unwrap(), "task2");
