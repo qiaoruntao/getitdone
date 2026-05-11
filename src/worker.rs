@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::future::{BoxFuture, Either, FutureExt};
@@ -60,10 +61,14 @@ impl Worker {
     /// that the caller used so both roles share a collection.
     pub async fn connect(config: Config) -> Result<Self, RequestError> {
         let collection = connect_collection(&config).await?;
+        let worker_id = config
+            .worker_id
+            .clone()
+            .unwrap_or_else(|| format!("worker-{}", Uuid::new_v4()));
         Ok(Worker {
             config,
             collection,
-            worker_id: format!("worker-{}", Uuid::new_v4()),
+            worker_id,
             max_inflight: DEFAULT_MAX_INFLIGHT,
         })
     }
@@ -136,8 +141,12 @@ where
     TOutput: Serialize + Send + Sync + 'static,
 {
     let mut join_set = JoinSet::new();
+    let in_flight_ids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let mut claim_ticker = time::interval(switch_maintenance_interval(worker_switch_timeout));
     claim_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Consume the immediate first tick so the sweep doesn't fire right after startup
+    // (startup already calls pump_available_tasks below).
+    claim_ticker.tick().await;
     let mut change_stream = match open_change_stream(&collection).await {
         Ok(stream) => stream,
         Err(err) => {
@@ -154,6 +163,7 @@ where
         &semaphore,
         &handler,
         &mut join_set,
+        &in_flight_ids,
     )
     .await;
 
@@ -174,6 +184,7 @@ where
                 &semaphore,
                 &handler,
                 &mut join_set,
+                &in_flight_ids,
             )
             .await;
             continue;
@@ -192,6 +203,7 @@ where
                     &semaphore,
                     &handler,
                     &mut join_set,
+                    &in_flight_ids,
                 ).await;
             }
             Some(result) = join_set.join_next(), if !join_set.is_empty() => {
@@ -217,6 +229,7 @@ where
                             &semaphore,
                             &handler,
                             &mut join_set,
+                            &in_flight_ids,
                         ).await;
                     }
                     Some(Err(_e)) => {
@@ -267,14 +280,19 @@ fn is_change_stream_unsupported(error: &mongodb::error::Error) -> bool {
     }
 }
 
-#[cfg_attr(feature = "tracing", tracing::instrument(skip(collection)))]
+#[cfg_attr(feature = "tracing", tracing::instrument(skip(collection, excluded_ids)))]
 async fn claim_next_task(
     collection: &Collection<Document>,
     worker_id: &str,
     worker_switch_timeout: Duration,
+    excluded_ids: &[String],
 ) -> Result<Option<Document>, RequestError> {
     let now = DateTime::now();
     let default_switch_timeout_ms = worker_switch_timeout.as_millis() as i64;
+    let excluded_bson: Vec<Bson> = excluded_ids
+        .iter()
+        .map(|id| Bson::String(id.clone()))
+        .collect();
     let filter = doc! {
         "$or": [
             {"status": "pending"},
@@ -302,6 +320,13 @@ async fn claim_next_task(
                         now,
                     ]
                 },
+            },
+            // Immediately reclaim tasks from a previous crash of this worker. The
+            // excluded_ids set prevents re-claiming tasks already running in this process.
+            {
+                "status": "running",
+                "worker_state.worker_id": worker_id,
+                "task_id": {"$nin": excluded_bson},
             },
         ]
     };
@@ -361,7 +386,7 @@ async fn open_change_stream(
 
 #[cfg_attr(
     feature = "tracing",
-    tracing::instrument(skip(collection, semaphore, handler, join_set))
+    tracing::instrument(skip(collection, semaphore, handler, join_set, in_flight_ids))
 )]
 async fn pump_available_tasks<TInput, TOutput>(
     collection: &Collection<Document>,
@@ -370,6 +395,7 @@ async fn pump_available_tasks<TInput, TOutput>(
     semaphore: &Arc<Semaphore>,
     handler: &WorkerHandler<TInput, TOutput>,
     join_set: &mut JoinSet<Result<(), RequestError>>,
+    in_flight_ids: &Arc<Mutex<HashSet<String>>>,
 ) where
     TInput: DeserializeOwned + Send + 'static,
     TOutput: Serialize + Send + Sync + 'static,
@@ -378,12 +404,16 @@ async fn pump_available_tasks<TInput, TOutput>(
         let Ok(permit) = semaphore.clone().try_acquire_owned() else {
             break;
         };
-        match claim_next_task(collection, worker_id, worker_switch_timeout).await {
+        let excluded: Vec<String> = in_flight_ids.lock().unwrap().iter().cloned().collect();
+        match claim_next_task(collection, worker_id, worker_switch_timeout, &excluded).await {
             Ok(Some(task)) => {
+                let task_id = task
+                    .get_str("task_id")
+                    .unwrap_or_default()
+                    .to_string();
                 #[cfg(feature = "tracing")]
-                if let Ok(id) = task.get_str("task_id") {
-                    info!(%worker_id, task_id=%id, "claimed task");
-                }
+                info!(%worker_id, %task_id, "claimed task");
+                in_flight_ids.lock().unwrap().insert(task_id.clone());
                 let handler = handler.clone();
                 join_set.spawn(process_task(
                     collection.clone(),
@@ -392,6 +422,8 @@ async fn pump_available_tasks<TInput, TOutput>(
                     handler,
                     permit,
                     worker_switch_timeout,
+                    task_id,
+                    in_flight_ids.clone(),
                 ));
             }
             Ok(None) => {
@@ -422,12 +454,18 @@ async fn process_task<TInput, TOutput>(
     handler: WorkerHandler<TInput, TOutput>,
     permit: OwnedSemaphorePermit,
     worker_switch_timeout: Duration,
+    inflight_task_id: String,
+    in_flight_ids: Arc<Mutex<HashSet<String>>>,
 ) -> Result<(), RequestError>
 where
     TInput: DeserializeOwned + Send + 'static,
     TOutput: Serialize + Send + Sync + 'static,
 {
     let _permit = permit;
+    let _in_flight_guard = InFlightGuard {
+        task_id: inflight_task_id,
+        in_flight_ids,
+    };
     #[cfg(feature = "tracing")]
     tracing::Span::current().record("worker_id", &worker_id);
 
@@ -663,6 +701,17 @@ fn switch_maintenance_interval(worker_switch_timeout: Duration) -> TokioDuration
         TokioDuration::from_millis(50),
         TokioDuration::from_millis(500),
     )
+}
+
+struct InFlightGuard {
+    task_id: String,
+    in_flight_ids: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight_ids.lock().unwrap().remove(&self.task_id);
+    }
 }
 
 /// Guard returned by `Worker::run` so callers can trigger graceful shutdowns
