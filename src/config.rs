@@ -9,6 +9,10 @@ pub struct Config {
     pub request_timeout: Option<Duration>,
     pub worker_switch_timeout: Duration,
     pub allow_reset_finished_tasks: bool,
+    /// Stable identity for this worker process. When set, the worker reclaims
+    /// its own in-progress tasks immediately on restart without waiting for the
+    /// heartbeat timeout. Defaults to a random UUID per process if not set.
+    pub worker_id: Option<String>,
 }
 
 impl Config {
@@ -25,6 +29,7 @@ pub struct ConfigBuilder {
     request_timeout: Option<Option<Duration>>,
     worker_switch_timeout: Option<Duration>,
     reset_finished_to_pending: bool,
+    worker_id: Option<String>,
 }
 
 impl ConfigBuilder {
@@ -61,6 +66,14 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set a stable worker identity. The worker will immediately reclaim its own
+    /// in-progress tasks on restart rather than waiting for the heartbeat timeout.
+    /// Typical values: hostname, "hostname:port", or a UUID stored in a local file.
+    pub fn worker_id(mut self, id: impl Into<String>) -> Self {
+        self.worker_id = Some(id.into());
+        self
+    }
+
     pub fn build(self) -> Config {
         self.finalize()
     }
@@ -76,6 +89,7 @@ impl ConfigBuilder {
                 .worker_switch_timeout
                 .unwrap_or_else(|| Duration::from_secs(10)),
             allow_reset_finished_tasks: self.reset_finished_to_pending,
+            worker_id: self.worker_id,
         }
     }
 }
