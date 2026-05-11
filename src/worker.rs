@@ -142,7 +142,7 @@ where
 {
     let mut join_set = JoinSet::new();
     let in_flight_ids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-    let mut claim_ticker = time::interval(switch_maintenance_interval(worker_switch_timeout));
+    let mut claim_ticker = time::interval(claim_sweep_interval(worker_switch_timeout));
     claim_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // Consume the immediate first tick so the sweep doesn't fire right after startup
     // (startup already calls pump_available_tasks below).
@@ -280,7 +280,10 @@ fn is_change_stream_unsupported(error: &mongodb::error::Error) -> bool {
     }
 }
 
-#[cfg_attr(feature = "tracing", tracing::instrument(skip(collection, excluded_ids)))]
+#[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(skip(collection, excluded_ids))
+)]
 async fn claim_next_task(
     collection: &Collection<Document>,
     worker_id: &str,
@@ -407,10 +410,7 @@ async fn pump_available_tasks<TInput, TOutput>(
         let excluded: Vec<String> = in_flight_ids.lock().unwrap().iter().cloned().collect();
         match claim_next_task(collection, worker_id, worker_switch_timeout, &excluded).await {
             Ok(Some(task)) => {
-                let task_id = task
-                    .get_str("task_id")
-                    .unwrap_or_default()
-                    .to_string();
+                let task_id = task.get_str("task_id").unwrap_or_default().to_string();
                 #[cfg(feature = "tracing")]
                 info!(%worker_id, %task_id, "claimed task");
                 in_flight_ids.lock().unwrap().insert(task_id.clone());
@@ -662,7 +662,7 @@ fn start_heartbeat_loop(
     worker_switch_timeout: Duration,
     mut stop_rx: oneshot::Receiver<()>,
 ) {
-    let interval = switch_maintenance_interval(worker_switch_timeout);
+    let interval = heartbeat_interval(worker_switch_timeout);
     tokio::spawn(async move {
         let mut ticker = time::interval(interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -695,9 +695,19 @@ fn task_switch_timeout(doc: &Document, fallback: Duration) -> Duration {
         .unwrap_or(fallback)
 }
 
-fn switch_maintenance_interval(worker_switch_timeout: Duration) -> TokioDuration {
+/// Interval between heartbeat ticks for a running task: one-third of the
+/// switch timeout, so at least three heartbeats land before the lease expires.
+fn heartbeat_interval(worker_switch_timeout: Duration) -> TokioDuration {
+    TokioDuration::from(worker_switch_timeout / 3)
+}
+
+/// Interval between periodic claim sweeps. Tasks become stealable only after
+/// their switch timeout, but the worker only knows its default timeout here.
+/// Keep the sweep bounded so tasks that request a shorter per-task timeout are
+/// still reclaimed promptly.
+fn claim_sweep_interval(worker_switch_timeout: Duration) -> TokioDuration {
     let third = worker_switch_timeout / 3;
-    third.clamp(
+    TokioDuration::from(third).clamp(
         TokioDuration::from_millis(50),
         TokioDuration::from_millis(500),
     )

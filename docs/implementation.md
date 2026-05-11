@@ -48,7 +48,7 @@ pub struct Config {
 
 - The caller and worker must be created from the same `Config`.
 - Each queue maps to a Mongo collection containing pending tasks plus worker state.
-- Optional knobs let us decide how long a caller waits and how soon a worker can steal in-flight work (including per-task switch delays).
+- Optional knobs let us decide how long a caller waits and the earliest point when a worker may steal in-flight work (including per-task switch delays). Actual reclaim still depends on when a worker runs its next claim sweep.
 - Builders can call `reset_finished_tasks(true)` if they want to reuse task ids that already finished (handy when replaying work manually after a restart).
 
 Workers rely on MongoDB change streams, so the deployment must be a replica set or sharded cluster. Standalone servers without change-stream support cause `Worker::connect` to error immediately.
@@ -71,7 +71,7 @@ Missing indexes only trigger warnings at runtime.
 4. **Process task** – The worker executes the user code (string length in the prototype), emits periodic heartbeats, and updates the Mongo document only if it still owns the task. Future versions may add retry loops.
 5. **Return value** – Callers awaiting inline rely on Mongo change streams (with a polling fallback) for notification. Callers that only have a `task_id` can later call `await_response(task_id)` to rehydrate the result, including failure details.
 
-Workers automatically mark their in-flight tasks as failed (with a shutdown reason) before a graceful shutdown. If a worker disappears without updating state, the per-task worker switch timeout ensures the task is unlocked and becomes stealable only after the requested delay.
+Workers automatically mark their in-flight tasks as failed (with a shutdown reason) before a graceful shutdown. If a worker disappears without updating state, the per-task worker switch timeout ensures the task is unlocked and becomes stealable only after the requested delay. In practice, another worker reclaims it on a subsequent claim sweep, so the observed recovery time can be a bit later than the configured timeout.
 
 Tasks remain durable in Mongo even if no worker is running yet, so `TaskId` lookups keep working across restarts.
 
