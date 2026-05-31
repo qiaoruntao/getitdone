@@ -210,7 +210,8 @@ where
     /// `succeeded` / `failed` doc matches, the reset is suppressed and the
     /// caller receives `RequestError::Duplicate`. Typical use: skip reset for
     /// tasks whose `task_output` carries a terminal classification the caller
-    /// does not want to redo (e.g. `{"task_output.is_ethnic": true}`).
+    /// does not want to redo (e.g. `{"task_output.classification": "rejected"}`
+    /// — finished docs missing the field still get reset).
     pub fn reset_blocked_when(mut self, filter: Document) -> Self {
         self.reset_blocked_when = Some(filter);
         self
