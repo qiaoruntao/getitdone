@@ -78,6 +78,7 @@ impl Caller {
             worker_switch_timeout: None,
             idempotency_key: None,
             reset_if_finished: None,
+            reset_blocked_when: None,
             trace_context,
             future: None,
             _marker: std::marker::PhantomData,
@@ -139,6 +140,7 @@ where
     worker_switch_timeout: Option<Duration>,
     idempotency_key: Option<String>,
     reset_if_finished: Option<bool>,
+    reset_blocked_when: Option<Document>,
     #[cfg(feature = "tracing")]
     trace_context: Option<TraceContext>,
     #[cfg(not(feature = "tracing"))]
@@ -159,7 +161,8 @@ where
             .field("timeout", &self.timeout)
             .field("worker_switch_timeout", &self.worker_switch_timeout)
             .field("idempotency_key", &self.idempotency_key)
-            .field("reset_if_finished", &self.reset_if_finished);
+            .field("reset_if_finished", &self.reset_if_finished)
+            .field("reset_blocked_when", &self.reset_blocked_when);
         #[cfg(feature = "tracing")]
         d.field("trace_context", &self.trace_context);
         d.field("future", &self.future.as_ref().map(|_| "..."))
@@ -201,6 +204,18 @@ where
         self
     }
 
+    /// Block the reset path when an existing finished document matches this
+    /// filter. Only meaningful together with `reset_if_finished(true)`. The
+    /// filter is evaluated atomically inside the upsert — if the existing
+    /// `succeeded` / `failed` doc matches, the reset is suppressed and the
+    /// caller receives `RequestError::Duplicate`. Typical use: skip reset for
+    /// tasks whose `task_output` carries a terminal classification the caller
+    /// does not want to redo (e.g. `{"task_output.is_ethnic": true}`).
+    pub fn reset_blocked_when(mut self, filter: Document) -> Self {
+        self.reset_blocked_when = Some(filter);
+        self
+    }
+
     /// Override the captured tracing metadata. Most callers can skip this and let
     /// `TraceContext::capture_current` run automatically.
     #[cfg(feature = "tracing")]
@@ -221,6 +236,7 @@ where
             worker_switch_timeout,
             idempotency_key,
             reset_if_finished,
+            reset_blocked_when,
             trace_context,
             ..
         } = self;
@@ -238,6 +254,7 @@ where
             worker_switch_timeout.unwrap_or(caller.config.worker_switch_timeout),
             idempotency_key,
             allow_reset,
+            reset_blocked_when,
             trace_context,
         )
         .await
@@ -260,6 +277,7 @@ where
         let allow_reset = self
             .reset_if_finished
             .unwrap_or(caller.config.allow_reset_finished_tasks);
+        let reset_blocked_when = self.reset_blocked_when.clone();
         let trace_context = self.trace_context.clone();
 
         Ok(Box::pin(async move {
@@ -269,6 +287,7 @@ where
                 worker_switch_timeout,
                 idempotency_key,
                 allow_reset,
+                reset_blocked_when,
                 trace_context,
             )
             .await?;
@@ -315,6 +334,7 @@ async fn upsert_task(
     worker_switch_timeout: Duration,
     idempotency_key: Option<String>,
     allow_reset_finished: bool,
+    reset_blocked_when: Option<Document>,
     #[cfg(feature = "tracing")] trace_context: Option<TraceContext>,
     #[cfg(not(feature = "tracing"))]
     #[allow(unused_variables)]
@@ -327,11 +347,20 @@ async fn upsert_task(
 
     // Build the filter: if reset is allowed, also match finished tasks
     let filter = if allow_reset_finished {
+        // The reset arm matches succeeded/failed docs. When the caller
+        // supplied `reset_blocked_when`, add it as a `$nor` so docs matching
+        // the blocker are *not* reset (caller sees Duplicate instead).
+        let mut reset_arm = doc! {
+            "status": { "$in": ["succeeded", "failed"] }
+        };
+        if let Some(blocker) = reset_blocked_when {
+            reset_arm.insert("$nor", vec![blocker]);
+        }
         doc! {
             "task_id": &task_id,
             "$or": [
                 { "status": { "$exists": false } }, // for upsert insert case
-                { "status": { "$in": ["succeeded", "failed"] } },
+                reset_arm,
             ]
         }
     } else {
