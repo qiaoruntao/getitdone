@@ -13,4 +13,4 @@ Quick reminders for anyone touching this repository:
 9. **No TTL scheduling** – do not use MongoDB TTL indexes or TTL deletion behavior to schedule task pickup, lease expiry, or recovery.
 10. **Prefer watched lease events** – periodic collection scanning is considered immature unless backed by concrete proof. Worker recovery should be driven by Mongo change streams plus local timers seeded from watched task state and startup reads.
 11. **Library-wide changes** – every modification, fix, and implementation must preserve behavior for all task types, not just the caller/worker payload that exposed the issue.
-12. **Agree before implementation** – agree on the fix direction before editing implementation code.
+12. **Agree before implementation** – see `/Users/qiaoruntao/projects/CLAUDE.md` → "Agree on approach before implementing".

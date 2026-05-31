@@ -90,7 +90,8 @@ async fn builder_overrides_are_persisted() {
         .with_trace_context(trace.clone())
         .enqueue_only()
         .await
-        .unwrap();
+        .unwrap()
+        .task_id;
 
     let client = Client::with_uri_str(&config.mongo_uri).await.unwrap();
     let stored = client

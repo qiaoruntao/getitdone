@@ -312,7 +312,8 @@ async fn test_task_level_worker_switch_timeout_controls_stealing() {
         .with_worker_switch_timeout(Duration::from_millis(250))
         .enqueue_only()
         .await
-        .unwrap();
+        .unwrap()
+        .task_id;
     claimed_rx.await.unwrap();
 
     let worker_b = Worker::connect(config.clone()).await.unwrap();

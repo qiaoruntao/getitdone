@@ -77,6 +77,7 @@ impl Caller {
             timeout: None,
             worker_switch_timeout: None,
             idempotency_key: None,
+            reset_if_finished: None,
             trace_context,
             future: None,
             _marker: std::marker::PhantomData,
@@ -100,8 +101,29 @@ impl Caller {
     where
         TInput: Serialize,
     {
-        self.send::<TInput, Bson>(payload).enqueue_only().await
+        self.send::<TInput, Bson>(payload)
+            .enqueue_only()
+            .await
+            .map(|outcome| outcome.task_id)
     }
+}
+
+/// What happened to the task document during enqueue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnqueueAction {
+    /// A brand new task document was inserted.
+    Inserted,
+    /// An existing task in a finished state (`succeeded` / `failed`) was reset
+    /// back to `pending` so a worker will pick it up again.
+    Reset,
+}
+
+/// Result of a successful enqueue: the task id plus a flag describing whether
+/// the doc was freshly inserted or reset from a finished state.
+#[derive(Clone, Debug)]
+pub struct EnqueueOutcome {
+    pub task_id: String,
+    pub action: EnqueueAction,
 }
 
 /// Builder returned by `Caller::send` that lets each request override defaults
@@ -116,6 +138,7 @@ where
     timeout: Option<Duration>,
     worker_switch_timeout: Option<Duration>,
     idempotency_key: Option<String>,
+    reset_if_finished: Option<bool>,
     #[cfg(feature = "tracing")]
     trace_context: Option<TraceContext>,
     #[cfg(not(feature = "tracing"))]
@@ -135,7 +158,8 @@ where
             .field("payload_err", &self.payload_err)
             .field("timeout", &self.timeout)
             .field("worker_switch_timeout", &self.worker_switch_timeout)
-            .field("idempotency_key", &self.idempotency_key);
+            .field("idempotency_key", &self.idempotency_key)
+            .field("reset_if_finished", &self.reset_if_finished);
         #[cfg(feature = "tracing")]
         d.field("trace_context", &self.trace_context);
         d.field("future", &self.future.as_ref().map(|_| "..."))
@@ -168,6 +192,15 @@ where
         self
     }
 
+    /// Override `Config::allow_reset_finished_tasks` for this single request.
+    /// When `true`, an existing document in `succeeded` / `failed` state with
+    /// the same idempotency key is reset to `pending` instead of returning
+    /// `RequestError::Duplicate`.
+    pub fn reset_if_finished(mut self, enable: bool) -> Self {
+        self.reset_if_finished = Some(enable);
+        self
+    }
+
     /// Override the captured tracing metadata. Most callers can skip this and let
     /// `TraceContext::capture_current` run automatically.
     #[cfg(feature = "tracing")]
@@ -177,14 +210,17 @@ where
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip(self)))]
-    /// Only insert the Mongo document and return the resulting `task_id`.
-    pub async fn enqueue_only(self) -> Result<String, RequestError> {
+    /// Only insert the Mongo document and return the resulting outcome
+    /// (task id plus whether the doc was inserted fresh or reset from a
+    /// finished state).
+    pub async fn enqueue_only(self) -> Result<EnqueueOutcome, RequestError> {
         let SendBuilder {
             caller,
             payload,
             payload_err,
             worker_switch_timeout,
             idempotency_key,
+            reset_if_finished,
             trace_context,
             ..
         } = self;
@@ -194,11 +230,14 @@ where
         let payload = payload.ok_or(RequestError::PayloadFormat {
             field: "task_input",
         })?;
+        let allow_reset =
+            reset_if_finished.unwrap_or(caller.config.allow_reset_finished_tasks);
         upsert_task(
             &caller,
             payload,
             worker_switch_timeout.unwrap_or(caller.config.worker_switch_timeout),
             idempotency_key,
+            allow_reset,
             trace_context,
         )
         .await
@@ -218,17 +257,22 @@ where
             .worker_switch_timeout
             .unwrap_or(caller.config.worker_switch_timeout);
         let idempotency_key = self.idempotency_key.clone();
+        let allow_reset = self
+            .reset_if_finished
+            .unwrap_or(caller.config.allow_reset_finished_tasks);
         let trace_context = self.trace_context.clone();
 
         Ok(Box::pin(async move {
-            let task_id = upsert_task(
+            let outcome = upsert_task(
                 &caller,
                 payload,
                 worker_switch_timeout,
                 idempotency_key,
+                allow_reset,
                 trace_context,
             )
             .await?;
+            let task_id = outcome.task_id;
             let wait_future = wait_for_result::<TOutput>(&caller.collection, &task_id);
             if let Some(timeout) = timeout {
                 tokio::time::timeout(timeout, wait_future)
@@ -270,18 +314,19 @@ async fn upsert_task(
     payload: Bson,
     worker_switch_timeout: Duration,
     idempotency_key: Option<String>,
+    allow_reset_finished: bool,
     #[cfg(feature = "tracing")] trace_context: Option<TraceContext>,
     #[cfg(not(feature = "tracing"))]
     #[allow(unused_variables)]
     trace_context: Option<()>,
-) -> Result<String, RequestError> {
+) -> Result<EnqueueOutcome, RequestError> {
     let task_id = idempotency_key.unwrap_or_else(|| Uuid::new_v4().to_string());
     #[cfg(feature = "tracing")]
     tracing::Span::current().record("task_id", &task_id);
     let now = DateTime::now();
 
     // Build the filter: if reset is allowed, also match finished tasks
-    let filter = if caller.config.allow_reset_finished_tasks {
+    let filter = if allow_reset_finished {
         doc! {
             "task_id": &task_id,
             "$or": [
@@ -342,8 +387,16 @@ async fn upsert_task(
     {
         Ok(result) => {
             // upserted_id is Some if inserted, None if updated an existing doc
-            if result.upserted_id.is_some() || result.matched_count > 0 {
-                Ok(task_id)
+            if result.upserted_id.is_some() {
+                Ok(EnqueueOutcome {
+                    task_id,
+                    action: EnqueueAction::Inserted,
+                })
+            } else if result.matched_count > 0 {
+                Ok(EnqueueOutcome {
+                    task_id,
+                    action: EnqueueAction::Reset,
+                })
             } else {
                 // No match and no insert means filter didn't match any resetable task
                 // and upsert couldn't insert (shouldn't happen normally)
