@@ -1,6 +1,6 @@
 [package]
 name = "getitdone"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
 authors = ["Qiao Runtao <qiaoruntao@example.com>"]
 description = "Experimenting with a simple Mongo-backed caller/worker bridge that keeps tracing context alive."
@@ -37,8 +37,8 @@ serde = { version = "1", features = ["derive"] }
 
 # Optional Tracing & OpenTelemetry
 tracing = { version = "0", optional = true }
-opentelemetry = { version = "0", optional = true }
-tracing-opentelemetry = { version = "0", optional = true }
+opentelemetry = { version = "0.28", optional = true }
+tracing-opentelemetry = { version = "0.29", optional = true }
 
 [dev-dependencies]
 opentelemetry-otlp = { version = "=0.28.0", features = ["grpc-tonic"] }
