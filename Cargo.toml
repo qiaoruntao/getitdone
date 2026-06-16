@@ -29,7 +29,7 @@ thiserror = "2"
 futures-util = "0.3"
 
 # MongoDB & Storage
-mongodb = { version = "3", features = ["bson-3", "zstd-compression", "snappy-compression", "zlib-compression"] }
+mongodb = { version = "3", default-features = false, features = ["compat-3-3-0", "bson-3", "rustls-tls", "dns-resolver", "zstd-compression", "snappy-compression", "zlib-compression"] }
 bson = { version = "3", features = ["serde"] }
 
 # Serialization
