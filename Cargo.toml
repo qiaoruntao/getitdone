@@ -1,6 +1,6 @@
 [package]
 name = "getitdone"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 authors = ["Qiao Runtao <qiaoruntao@example.com>"]
 description = "Experimenting with a simple Mongo-backed caller/worker bridge that keeps tracing context alive."
