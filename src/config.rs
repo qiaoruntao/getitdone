@@ -13,6 +13,12 @@ pub struct Config {
     /// its own in-progress tasks immediately on restart without waiting for the
     /// heartbeat timeout. Defaults to a random UUID per process if not set.
     pub worker_id: Option<String>,
+    /// Emit OpenTelemetry metrics for worker database operations (claim sweep
+    /// duration, heartbeat write duration, heartbeat outcome counts). Requires
+    /// the `tracing` feature and an OTel `MeterProvider` already installed as
+    /// the global one (the same one used for tracing/logging); a no-op otherwise.
+    /// Defaults to `false`.
+    pub enable_metrics: bool,
 }
 
 impl Config {
@@ -30,6 +36,7 @@ pub struct ConfigBuilder {
     worker_switch_timeout: Option<Duration>,
     reset_finished_to_pending: bool,
     worker_id: Option<String>,
+    enable_metrics: bool,
 }
 
 impl ConfigBuilder {
@@ -74,6 +81,13 @@ impl ConfigBuilder {
         self
     }
 
+    /// Emit OpenTelemetry metrics for worker database operations. Requires the
+    /// `tracing` feature; a no-op otherwise. Defaults to `false`.
+    pub fn enable_metrics(mut self, enable: bool) -> Self {
+        self.enable_metrics = enable;
+        self
+    }
+
     pub fn build(self) -> Config {
         self.finalize()
     }
@@ -90,6 +104,7 @@ impl ConfigBuilder {
                 .unwrap_or_else(|| Duration::from_secs(10)),
             allow_reset_finished_tasks: self.reset_finished_to_pending,
             worker_id: self.worker_id,
+            enable_metrics: self.enable_metrics,
         }
     }
 }

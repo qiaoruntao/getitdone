@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use getitdone::{Caller, Config, RequestError, TraceContext, Worker, WorkerJob};
@@ -280,6 +281,148 @@ async fn test_running_peer_steals_after_heartbeat_expires_without_new_task() {
     assert_eq!(result.msg, "recovered-by-active-peer");
 
     handle_b.shutdown().await;
+}
+
+// If ownership of a task is reclaimed out from under an in-flight handler (e.g.
+// a duplicate claim caused by a heartbeat that fell behind), the worker must
+// actively abort that handler once its heartbeat loop notices, not let it keep
+// running unsupervised. This proves cancellation actually happens, not just
+// that the ownership check would reject a stale write.
+#[tokio::test]
+async fn test_lost_ownership_aborts_in_flight_handler() {
+    let mut config = test_config().await;
+    config.worker_switch_timeout = Duration::from_millis(150);
+
+    let worker = Worker::connect(config.clone()).await.unwrap();
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let started_tx = std::sync::Arc::new(std::sync::Mutex::new(Some(started_tx)));
+    let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+
+    struct AbortSignal(std::sync::Arc<AtomicBool>);
+    impl Drop for AbortSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let cancelled_for_handler = cancelled.clone();
+    let handle = worker.run(move |_: WorkerJob<EchoInput>| {
+        let started_tx = started_tx.clone();
+        let _abort_signal = AbortSignal(cancelled_for_handler.clone());
+        async move {
+            if let Some(tx) = started_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let _abort_signal = _abort_signal;
+            std::future::pending::<Result<EchoOutput, RequestError>>().await
+        }
+    });
+
+    let caller = Caller::connect(config.clone()).await.unwrap();
+    let task_id = caller
+        .dispatch(EchoInput {
+            msg: "steal-me".into(),
+        })
+        .await
+        .unwrap();
+    started_rx.await.unwrap();
+    assert!(
+        !cancelled.load(Ordering::SeqCst),
+        "handler was cancelled before ownership was ever lost"
+    );
+
+    // Simulate another claim silently superseding this one (e.g. a duplicate
+    // reclaim elsewhere), bypassing the library so the running handler has no
+    // way to know except via its own heartbeat loop noticing the mismatch.
+    let client = Client::with_uri_str(MONGO_URI).await.unwrap();
+    let collection: Collection<Document> = client
+        .database("getitdone_test")
+        .collection(&config.collection);
+    collection
+        .update_one(
+            doc! {"task_id": &task_id},
+            doc! {"$set": {"worker_state.claim_token": "someone-else-now-owns-this"}},
+        )
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !cancelled.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("handler was not aborted after losing ownership");
+
+    handle.shutdown().await;
+}
+
+// Config::enable_metrics should make the worker actually emit OpenTelemetry
+// metrics for its DB operations, not just accept the flag silently.
+#[tokio::test]
+async fn test_metrics_emitted_when_enabled() {
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+
+    let exporter = InMemoryMetricExporter::default();
+    let reader = PeriodicReader::builder(exporter.clone()).build();
+    let provider = SdkMeterProvider::builder().with_reader(reader).build();
+    opentelemetry::global::set_meter_provider(provider.clone());
+
+    let mut config = test_config().await;
+    config.worker_switch_timeout = Duration::from_millis(150);
+    config.enable_metrics = true;
+
+    let worker = Worker::connect(config.clone()).await.unwrap();
+    let handle = worker.run(|job: WorkerJob<EchoInput>| async move {
+        // Long enough that at least one heartbeat tick (every ~50ms here) fires
+        // before the handler completes, so heartbeat metrics have data too.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        Ok(EchoOutput {
+            msg: job.payload.msg,
+        })
+    });
+
+    let caller = Caller::connect(config.clone()).await.unwrap();
+    let result: EchoOutput = caller
+        .send(EchoInput {
+            msg: "metrics-check".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.msg, "metrics-check");
+
+    handle.shutdown().await;
+    provider.force_flush().expect("force_flush should not fail");
+
+    let resource_metrics = exporter
+        .get_finished_metrics()
+        .expect("get_finished_metrics should not fail");
+    let metric_names: Vec<String> = resource_metrics
+        .iter()
+        .flat_map(|rm| rm.scope_metrics.iter())
+        .flat_map(|sm| sm.metrics.iter())
+        .map(|m| m.name.to_string())
+        .collect();
+
+    assert!(
+        metric_names
+            .iter()
+            .any(|n| n == "getitdone.worker.claim.duration_ms"),
+        "expected claim duration metric, got: {metric_names:?}"
+    );
+    assert!(
+        metric_names
+            .iter()
+            .any(|n| n == "getitdone.worker.heartbeat.duration_ms"),
+        "expected heartbeat duration metric, got: {metric_names:?}"
+    );
+    assert!(
+        metric_names
+            .iter()
+            .any(|n| n == "getitdone.worker.heartbeat.outcome"),
+        "expected heartbeat outcome metric, got: {metric_names:?}"
+    );
 }
 
 #[tokio::test]

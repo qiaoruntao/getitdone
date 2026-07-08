@@ -314,10 +314,7 @@ where
 /// Per-request always wins. The config flag, when no per-request predicate is
 /// set, is interpreted as a match-everything predicate (`{}`) for back-compat
 /// with callers that only set the config knob.
-fn effective_reset_predicate(
-    per_request: Option<Document>,
-    config: &Config,
-) -> Option<Document> {
+fn effective_reset_predicate(per_request: Option<Document>, config: &Config) -> Option<Document> {
     per_request.or_else(|| {
         if config.allow_reset_finished_tasks {
             Some(Document::new())

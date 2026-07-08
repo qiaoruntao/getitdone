@@ -1,6 +1,8 @@
 mod caller;
 mod config;
 mod error;
+#[cfg(feature = "tracing")]
+mod metrics;
 mod storage;
 #[cfg(feature = "tracing")]
 mod trace;

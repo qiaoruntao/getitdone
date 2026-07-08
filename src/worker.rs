@@ -14,7 +14,7 @@ use mongodb::change_stream::{ChangeStream, event::ChangeStreamEvent};
 use mongodb::error::{CommandError, ErrorKind};
 use mongodb::options::{FullDocumentType, ReturnDocument};
 #[cfg(feature = "tracing")]
-use opentelemetry as _;
+use opentelemetry::KeyValue;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
@@ -28,9 +28,21 @@ use uuid::Uuid;
 
 use crate::config::Config;
 use crate::error::RequestError;
+#[cfg(feature = "tracing")]
+use crate::metrics::WorkerMetrics;
 use crate::storage::connect_collection;
 #[cfg(feature = "tracing")]
 use crate::trace::TraceContext;
+
+// Metrics are entirely optional (Config::enable_metrics) and require the
+// `tracing` feature for the opentelemetry dependency they're built on. This
+// alias lets `Option<WorkerMetricsHandle>` be threaded through the same way
+// regardless of feature flags, mirroring how `WorkerJob::trace_context` swaps
+// between `Option<TraceContext>` and `Option<()>` above.
+#[cfg(feature = "tracing")]
+type WorkerMetricsHandle = WorkerMetrics;
+#[cfg(not(feature = "tracing"))]
+type WorkerMetricsHandle = ();
 
 const DEFAULT_MAX_INFLIGHT: usize = 10000;
 
@@ -106,6 +118,10 @@ impl Worker {
             max_inflight,
             task_semaphore: semaphore.clone(),
         };
+        #[cfg(feature = "tracing")]
+        let metrics: Option<WorkerMetricsHandle> = config.enable_metrics.then(WorkerMetrics::new);
+        #[cfg(not(feature = "tracing"))]
+        let metrics: Option<WorkerMetricsHandle> = None;
         let join_handle = tokio::spawn(worker_loop(
             collection,
             stop_rx,
@@ -114,6 +130,7 @@ impl Worker {
             max_inflight,
             semaphore.clone(),
             handler,
+            metrics,
         ));
         WorkerHandle {
             stop_signal: Some(stop_tx),
@@ -125,7 +142,7 @@ impl Worker {
 
 #[cfg_attr(
     feature = "tracing",
-    tracing::instrument(skip(collection, stop_rx, semaphore, handler))
+    tracing::instrument(skip(collection, stop_rx, semaphore, handler, metrics))
 )]
 async fn worker_loop<TInput, TOutput>(
     collection: Collection<Document>,
@@ -135,6 +152,7 @@ async fn worker_loop<TInput, TOutput>(
     max_inflight: usize,
     semaphore: Arc<Semaphore>,
     handler: WorkerHandler<TInput, TOutput>,
+    metrics: Option<WorkerMetricsHandle>,
 ) -> Result<(), RequestError>
 where
     TInput: DeserializeOwned + Send + 'static,
@@ -164,6 +182,7 @@ where
         &handler,
         &mut join_set,
         &in_flight_ids,
+        &metrics,
     )
     .await;
 
@@ -185,6 +204,7 @@ where
                 &handler,
                 &mut join_set,
                 &in_flight_ids,
+                &metrics,
             )
             .await;
             continue;
@@ -204,6 +224,7 @@ where
                     &handler,
                     &mut join_set,
                     &in_flight_ids,
+                    &metrics,
                 ).await;
             }
             Some(result) = join_set.join_next(), if !join_set.is_empty() => {
@@ -230,6 +251,7 @@ where
                             &handler,
                             &mut join_set,
                             &in_flight_ids,
+                            &metrics,
                         ).await;
                     }
                     Some(Err(_e)) => {
@@ -302,6 +324,10 @@ async fn claim_next_task(
             {
                 "status": "running",
                 "worker_state.heartbeat_at": {"$type": "date"},
+                // A task this process is currently running must never be reclaimed
+                // via staleness, even if its heartbeat write falls behind under load:
+                // that would spawn a second concurrent handler for the same task.
+                "task_id": {"$nin": excluded_bson.clone()},
                 "$expr": {
                     "$lte": [
                         {
@@ -333,12 +359,17 @@ async fn claim_next_task(
             },
         ]
     };
+    let claim_token = Uuid::new_v4().to_string();
     let update = doc! {
         "$set": {
             "status": "running",
             "updated_at": DateTime::now(),
             "worker_state": {
                 "worker_id": worker_id,
+                // Unique per claim (not per worker), so a superseded claim can be
+                // told apart from the one currently holding the task even when
+                // both share the same worker_id -- see heartbeat()/mark_task_failed().
+                "claim_token": claim_token,
                 "started_at": DateTime::now(),
                 "heartbeat_at": DateTime::now(),
                 "switch_timeout_ms": worker_switch_timeout.as_millis() as i64,
@@ -389,7 +420,7 @@ async fn open_change_stream(
 
 #[cfg_attr(
     feature = "tracing",
-    tracing::instrument(skip(collection, semaphore, handler, join_set, in_flight_ids))
+    tracing::instrument(skip(collection, semaphore, handler, join_set, in_flight_ids, metrics))
 )]
 async fn pump_available_tasks<TInput, TOutput>(
     collection: &Collection<Document>,
@@ -399,6 +430,7 @@ async fn pump_available_tasks<TInput, TOutput>(
     handler: &WorkerHandler<TInput, TOutput>,
     join_set: &mut JoinSet<Result<(), RequestError>>,
     in_flight_ids: &Arc<Mutex<HashSet<String>>>,
+    metrics: &Option<WorkerMetricsHandle>,
 ) where
     TInput: DeserializeOwned + Send + 'static,
     TOutput: Serialize + Send + Sync + 'static,
@@ -408,7 +440,16 @@ async fn pump_available_tasks<TInput, TOutput>(
             break;
         };
         let excluded: Vec<String> = in_flight_ids.lock().unwrap().iter().cloned().collect();
-        match claim_next_task(collection, worker_id, worker_switch_timeout, &excluded).await {
+        #[cfg(feature = "tracing")]
+        let claim_started_at = std::time::Instant::now();
+        let claim_result =
+            claim_next_task(collection, worker_id, worker_switch_timeout, &excluded).await;
+        #[cfg(feature = "tracing")]
+        if let Some(m) = metrics.as_ref() {
+            m.claim_duration_ms
+                .record(claim_started_at.elapsed().as_secs_f64() * 1000.0, &[]);
+        }
+        match claim_result {
             Ok(Some(task)) => {
                 let task_id = task.get_str("task_id").unwrap_or_default().to_string();
                 #[cfg(feature = "tracing")]
@@ -424,6 +465,7 @@ async fn pump_available_tasks<TInput, TOutput>(
                     worker_switch_timeout,
                     task_id,
                     in_flight_ids.clone(),
+                    metrics.clone(),
                 ));
             }
             Ok(None) => {
@@ -443,7 +485,7 @@ async fn pump_available_tasks<TInput, TOutput>(
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(
-        skip(collection, doc, handler, permit),
+        skip(collection, doc, handler, permit, metrics),
         fields(task_id, worker_id, trace_id)
     )
 )]
@@ -456,6 +498,7 @@ async fn process_task<TInput, TOutput>(
     worker_switch_timeout: Duration,
     inflight_task_id: String,
     in_flight_ids: Arc<Mutex<HashSet<String>>>,
+    metrics: Option<WorkerMetricsHandle>,
 ) -> Result<(), RequestError>
 where
     TInput: DeserializeOwned + Send + 'static,
@@ -478,6 +521,17 @@ where
     };
     #[cfg(feature = "tracing")]
     tracing::Span::current().record("task_id", &task_id);
+
+    // Identifies this specific claim, not just this worker: heartbeat/completion/
+    // failure writes below must all be scoped to it so a superseded claim (e.g. one
+    // this same worker_id re-claimed after a stale heartbeat) can never affect a
+    // task another, current claim now owns.
+    let claim_token = doc
+        .get_document("worker_state")
+        .ok()
+        .and_then(|ws| ws.get_str("claim_token").ok())
+        .unwrap_or_default()
+        .to_string();
 
     #[cfg(feature = "tracing")]
     type SetupResult<T> = Result<(T, Option<TraceContext>), RequestError>;
@@ -508,7 +562,7 @@ where
         #[cfg(not(feature = "tracing"))]
         let trace_context = None;
 
-        if !heartbeat(&collection, &task_id, &worker_id).await? {
+        if !heartbeat(&collection, &task_id, &worker_id, &claim_token).await? {
             #[cfg(feature = "tracing")]
             error!(%worker_id, %task_id, "lost ownership before handler start");
             return Err(RequestError::WorkerGone);
@@ -519,10 +573,18 @@ where
 
     let (payload, trace_context) = match setup_result {
         Ok(v) => v,
+        Err(RequestError::WorkerGone) => {
+            // Ownership is already confirmed lost (the heartbeat check above didn't
+            // match this claim_token) -- another claim owns this task now. Marking
+            // it "failed" here would stomp whatever that current claim is doing.
+            return Err(RequestError::WorkerGone);
+        }
         Err(err) => {
             mark_task_failed(
                 &collection,
                 &task_id,
+                &worker_id,
+                &claim_token,
                 &format!("infrastructure error: {err}"),
             )
             .await;
@@ -537,12 +599,19 @@ where
     };
     let task_switch_timeout = task_switch_timeout(&doc, worker_switch_timeout);
     let (hb_stop_tx, hb_stop_rx) = oneshot::channel();
+    // Fires when the heartbeat loop finds this claim_token no longer owns the task
+    // (superseded by a newer claim), so the in-flight handler below can be aborted
+    // instead of silently racing a claim that already moved on.
+    let (lost_ownership_tx, mut lost_ownership_rx) = oneshot::channel::<()>();
     start_heartbeat_loop(
         collection.clone(),
         task_id.clone(),
         worker_id.clone(),
+        claim_token.clone(),
         task_switch_timeout,
         hb_stop_rx,
+        lost_ownership_tx,
+        metrics,
     );
 
     #[cfg(feature = "tracing")]
@@ -567,13 +636,28 @@ where
         }
     }
 
-    #[cfg(feature = "tracing")]
-    let handler_result = {
-        let _guard = handler_span.enter();
-        handler(job).await
+    let handler_future = async {
+        #[cfg(feature = "tracing")]
+        {
+            let _guard = handler_span.enter();
+            handler(job).await
+        }
+        #[cfg(not(feature = "tracing"))]
+        {
+            handler(job).await
+        }
     };
-    #[cfg(not(feature = "tracing"))]
-    let handler_result = handler(job).await;
+    tokio::pin!(handler_future);
+
+    let handler_result = tokio::select! {
+        result = &mut handler_future => result,
+        _ = &mut lost_ownership_rx => {
+            #[cfg(feature = "tracing")]
+            error!(%worker_id, %task_id, "task reclaimed by another claim; aborting in-flight handler");
+            // handler_future is dropped here, cancelling whatever it was doing.
+            return Err(RequestError::WorkerGone);
+        }
+    };
 
     let _ = hb_stop_tx.send(());
     match handler_result {
@@ -586,6 +670,7 @@ where
                 "task_id": &task_id,
                 "status": "running",
                 "worker_state.worker_id": &worker_id,
+                "worker_state.claim_token": &claim_token,
             };
             let update = doc! {
                 "$set": {
@@ -609,14 +694,35 @@ where
             Ok(())
         }
         Err(err) => {
-            mark_task_failed(&collection, &task_id, &format!("handler error: {err}")).await;
+            mark_task_failed(
+                &collection,
+                &task_id,
+                &worker_id,
+                &claim_token,
+                &format!("handler error: {err}"),
+            )
+            .await;
             Err(err)
         }
     }
 }
 
 #[cfg_attr(feature = "tracing", tracing::instrument(skip(collection)))]
-async fn mark_task_failed(collection: &Collection<Document>, task_id: &str, reason: &str) {
+async fn mark_task_failed(
+    collection: &Collection<Document>,
+    task_id: &str,
+    worker_id: &str,
+    claim_token: &str,
+    reason: &str,
+) {
+    // Scoped to this exact claim: an already-superseded claim must never be able
+    // to overwrite a task a newer claim owns, even by marking it "failed".
+    let filter = doc! {
+        "task_id": task_id,
+        "status": "running",
+        "worker_state.worker_id": worker_id,
+        "worker_state.claim_token": claim_token,
+    };
     let update = doc! {
         "$set": {
             "status": "failed",
@@ -625,12 +731,18 @@ async fn mark_task_failed(collection: &Collection<Document>, task_id: &str, reas
             "worker_state.finished_at": DateTime::now(),
         }
     };
-    if let Err(_e) = collection
-        .update_one(doc! {"task_id": task_id}, update)
-        .await
-    {
-        #[cfg(feature = "tracing")]
-        error!(task_id=%task_id, error=%_e, "failed to mark task as failed");
+    match collection.update_one(filter, update).await {
+        Ok(result) if result.matched_count == 0 => {
+            // Not an error: this claim was already superseded, so the task is no
+            // longer ours to fail. Whoever holds it now is responsible for it.
+            #[cfg(feature = "tracing")]
+            info!(%worker_id, %task_id, "skipped marking task failed; claim already superseded");
+        }
+        Ok(_) => {}
+        Err(_e) => {
+            #[cfg(feature = "tracing")]
+            error!(task_id=%task_id, error=%_e, "failed to mark task as failed");
+        }
     }
 }
 
@@ -639,11 +751,13 @@ async fn heartbeat(
     collection: &Collection<Document>,
     task_id: &str,
     worker_id: &str,
+    claim_token: &str,
 ) -> Result<bool, RequestError> {
     let filter = doc! {
         "task_id": task_id,
         "status": "running",
         "worker_state.worker_id": worker_id,
+        "worker_state.claim_token": claim_token,
     };
     let update = doc! {
         "$set": {"worker_state.heartbeat_at": DateTime::now()}
@@ -655,12 +769,44 @@ async fn heartbeat(
     Ok(result.matched_count > 0)
 }
 
+/// What a single heartbeat attempt tells us about ownership. Kept as an explicit
+/// enum (rather than matching `Result<bool, RequestError>` inline) so the
+/// distinction between "definitely superseded" and "couldn't confirm either way"
+/// is a named, independently testable decision -- not just a comment next to a
+/// match arm. Only `Superseded` may ever trigger aborting the running handler;
+/// `TransientError` (a network blip, timeout, etc.) must never be treated the
+/// same way, since the task may still be legitimately ours.
+#[derive(Debug, PartialEq, Eq)]
+enum HeartbeatOutcome {
+    /// The write landed and matched: this claim still owns the task.
+    Alive,
+    /// The write landed but matched nothing: this exact claim_token no longer
+    /// owns the task (a newer claim replaced it, or it finished/failed). This
+    /// is the only outcome that should ever cause the handler to be aborted.
+    Superseded,
+    /// The write itself failed (network, timeout, transient Mongo error). This
+    /// proves nothing about ownership -- treat it as "couldn't confirm", not
+    /// as evidence of loss.
+    TransientError,
+}
+
+fn classify_heartbeat_result(result: Result<bool, RequestError>) -> HeartbeatOutcome {
+    match result {
+        Ok(true) => HeartbeatOutcome::Alive,
+        Ok(false) => HeartbeatOutcome::Superseded,
+        Err(_) => HeartbeatOutcome::TransientError,
+    }
+}
+
 fn start_heartbeat_loop(
     collection: Collection<Document>,
     task_id: String,
     worker_id: String,
+    claim_token: String,
     worker_switch_timeout: Duration,
     mut stop_rx: oneshot::Receiver<()>,
+    lost_ownership_tx: oneshot::Sender<()>,
+    metrics: Option<WorkerMetricsHandle>,
 ) {
     let interval = heartbeat_interval(worker_switch_timeout);
     tokio::spawn(async move {
@@ -672,10 +818,43 @@ fn start_heartbeat_loop(
                     break;
                 }
                 _ = ticker.tick() => {
-                    if let Err(_e) = heartbeat(&collection, &task_id, &worker_id).await {
-                        #[cfg(feature = "tracing")]
-                        error!(%worker_id, %task_id, error=%_e, "heartbeat failed");
-                        break;
+                    #[cfg(feature = "tracing")]
+                    let started_at = std::time::Instant::now();
+                    let result = heartbeat(&collection, &task_id, &worker_id, &claim_token).await;
+                    #[cfg(feature = "tracing")]
+                    let err_for_log = if let Err(ref e) = result { Some(e.to_string()) } else { None };
+                    let outcome = classify_heartbeat_result(result);
+                    #[cfg(feature = "tracing")]
+                    if let Some(m) = metrics.as_ref() {
+                        m.heartbeat_duration_ms
+                            .record(started_at.elapsed().as_secs_f64() * 1000.0, &[]);
+                        let outcome_label = match outcome {
+                            HeartbeatOutcome::Alive => "alive",
+                            HeartbeatOutcome::Superseded => "superseded",
+                            HeartbeatOutcome::TransientError => "transient_error",
+                        };
+                        m.heartbeat_outcome
+                            .add(1, &[KeyValue::new("outcome", outcome_label)]);
+                    }
+                    match outcome {
+                        HeartbeatOutcome::Alive => {}
+                        HeartbeatOutcome::Superseded => {
+                            // Definitive: tell process_task to abort the handler
+                            // rather than let it keep running unsupervised.
+                            #[cfg(feature = "tracing")]
+                            error!(%worker_id, %task_id, "heartbeat found claim superseded; signaling abort");
+                            let _ = lost_ownership_tx.send(());
+                            break;
+                        }
+                        HeartbeatOutcome::TransientError => {
+                            // Does NOT signal lost_ownership_tx: a network/DB
+                            // hiccup doesn't prove the task was reclaimed. Stop
+                            // trying to refresh the lease and let staleness or
+                            // the final completion check decide instead.
+                            #[cfg(feature = "tracing")]
+                            error!(%worker_id, %task_id, error = err_for_log.as_deref().unwrap_or(""), "heartbeat failed");
+                            break;
+                        }
                     }
                 }
             }
@@ -816,5 +995,227 @@ impl Drop for WorkerHandle {
         if let Some(handle) = self.join_handle.take() {
             handle.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    use super::*;
+    use crate::config::Config;
+    use std::time::SystemTime;
+
+    async fn test_collection(name_prefix: &str) -> Collection<Document> {
+        let config = Config::builder()
+            .mongo_uri("mongodb://localhost:27017")
+            .database("getitdone_test")
+            .collection(format!("{name_prefix}_{}", Uuid::new_v4()))
+            .worker_switch_timeout(Duration::from_millis(50))
+            .build();
+        connect_collection(&config)
+            .await
+            .expect("connect collection")
+    }
+
+    async fn insert_stale_running_task(
+        collection: &Collection<Document>,
+        task_id: &str,
+        worker_id: &str,
+    ) {
+        let stale = Bson::DateTime(DateTime::from_system_time(
+            SystemTime::now() - Duration::from_secs(60),
+        ));
+        collection
+            .insert_one(doc! {
+                "task_id": task_id,
+                "status": "running",
+                "task_input": {},
+                "updated_at": DateTime::now(),
+                "worker_state": {
+                    "worker_id": worker_id,
+                    "started_at": stale.clone(),
+                    "heartbeat_at": stale,
+                    "switch_timeout_ms": 50i64,
+                }
+            })
+            .await
+            .expect("insert stale running task");
+    }
+
+    // A worker must never re-claim a task it is currently processing, even if
+    // that task's heartbeat looks stale (e.g. the heartbeat write fell behind
+    // under load). Otherwise it spawns a second concurrent handler for the
+    // same task_id -- the exact double-claim bug this test guards against.
+    #[tokio::test]
+    async fn stale_heartbeat_does_not_reclaim_own_in_flight_task() {
+        let collection = test_collection("claim_self_steal").await;
+        let task_id = "in-flight-task";
+        let worker_id = "worker-1";
+        insert_stale_running_task(&collection, task_id, worker_id).await;
+
+        let excluded = vec![task_id.to_string()];
+        let result = claim_next_task(&collection, worker_id, Duration::from_millis(50), &excluded)
+            .await
+            .expect("claim_next_task should not error");
+
+        assert!(
+            result.is_none(),
+            "worker re-claimed a task it already has in flight"
+        );
+
+        let _ = collection.drop().await;
+    }
+
+    // Sanity check: the same stale task, when NOT in the caller's in-flight
+    // set (e.g. a genuinely abandoned task from a dead worker), must still be
+    // reclaimable. This confirms the fix only narrows the in-flight case and
+    // does not break legitimate stale-task recovery.
+    #[tokio::test]
+    async fn stale_heartbeat_still_reclaims_when_not_in_flight() {
+        let collection = test_collection("claim_legit_steal").await;
+        let task_id = "abandoned-task";
+        let worker_id = "worker-1";
+        insert_stale_running_task(&collection, task_id, worker_id).await;
+
+        let result = claim_next_task(&collection, worker_id, Duration::from_millis(50), &[])
+            .await
+            .expect("claim_next_task should not error");
+
+        assert!(
+            result.is_some(),
+            "worker failed to reclaim a genuinely stale, non-in-flight task"
+        );
+
+        let _ = collection.drop().await;
+    }
+
+    async fn insert_running_task(
+        collection: &Collection<Document>,
+        task_id: &str,
+        worker_id: &str,
+        claim_token: &str,
+    ) {
+        collection
+            .insert_one(doc! {
+                "task_id": task_id,
+                "status": "running",
+                "task_input": {},
+                "updated_at": DateTime::now(),
+                "worker_state": {
+                    "worker_id": worker_id,
+                    "claim_token": claim_token,
+                    "started_at": DateTime::now(),
+                    "heartbeat_at": DateTime::now(),
+                    "switch_timeout_ms": 50i64,
+                }
+            })
+            .await
+            .expect("insert running task");
+    }
+
+    // A stale claim_token (this claim was superseded by a newer one, e.g. after a
+    // reclaim) must be rejected even though worker_id still matches -- worker_id
+    // alone is not a valid ownership fence, since two claims by the same worker_id
+    // are indistinguishable without it.
+    #[tokio::test]
+    async fn heartbeat_rejects_superseded_claim_token() {
+        let collection = test_collection("heartbeat_fencing").await;
+        let task_id = "task-a";
+        let worker_id = "worker-1";
+        insert_running_task(&collection, task_id, worker_id, "current-token").await;
+
+        let stale = heartbeat(&collection, task_id, worker_id, "old-superseded-token")
+            .await
+            .expect("heartbeat should not error");
+        assert!(!stale, "heartbeat matched a superseded claim_token");
+
+        let current = heartbeat(&collection, task_id, worker_id, "current-token")
+            .await
+            .expect("heartbeat should not error");
+        assert!(current, "heartbeat rejected the current claim_token");
+
+        let _ = collection.drop().await;
+    }
+
+    // A superseded claim must not be able to overwrite a task a newer claim owns
+    // by marking it "failed" -- that would corrupt state for the current owner.
+    #[tokio::test]
+    async fn mark_task_failed_ignores_superseded_claim_token() {
+        let collection = test_collection("mark_failed_fencing").await;
+        let task_id = "task-b";
+        let worker_id = "worker-1";
+        insert_running_task(&collection, task_id, worker_id, "current-token").await;
+
+        mark_task_failed(
+            &collection,
+            task_id,
+            worker_id,
+            "old-superseded-token",
+            "stale handler error",
+        )
+        .await;
+
+        let doc = collection
+            .find_one(doc! {"task_id": task_id})
+            .await
+            .expect("find_one should not error")
+            .expect("task should still exist");
+        assert_eq!(
+            doc.get_str("status").unwrap(),
+            "running",
+            "superseded claim was able to overwrite the current claim's status"
+        );
+
+        let _ = collection.drop().await;
+    }
+
+    // Pure logic, no DB needed: the classifier is the single source of truth for
+    // "does this outcome permit aborting the handler". Pin all three cases down
+    // directly so the Ok(false)-vs-Err distinction can't silently drift.
+    #[test]
+    fn classify_heartbeat_result_distinguishes_superseded_from_transient_error() {
+        assert_eq!(classify_heartbeat_result(Ok(true)), HeartbeatOutcome::Alive);
+        assert_eq!(
+            classify_heartbeat_result(Ok(false)),
+            HeartbeatOutcome::Superseded
+        );
+        assert_eq!(
+            classify_heartbeat_result(Err(RequestError::Database("connection reset".into()))),
+            HeartbeatOutcome::TransientError
+        );
+        assert_eq!(
+            classify_heartbeat_result(Err(RequestError::Timeout)),
+            HeartbeatOutcome::TransientError
+        );
+    }
+
+    // A network/DB failure (e.g. a timeout reaching Mongo) must surface as an
+    // Err from heartbeat(), never as Ok(false). Ok(false) means "the write
+    // landed and found a different claim_token" -- a network problem proves
+    // neither that nor the opposite, and conflating the two would abort a
+    // handler that may still legitimately own its task.
+    #[tokio::test]
+    async fn heartbeat_reports_unreachable_db_as_transient_error_not_superseded() {
+        let config = Config::builder()
+            .mongo_uri("mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=200&connectTimeoutMS=200")
+            .database("getitdone_test")
+            .collection(format!("unreachable_{}", Uuid::new_v4()))
+            .worker_switch_timeout(Duration::from_millis(50))
+            .build();
+        // connect_collection succeeds without a real connection (the driver
+        // connects lazily on first operation) -- the failure only surfaces once
+        // we actually try to talk to it below.
+        let collection = connect_collection(&config)
+            .await
+            .expect("connect_collection should not eagerly dial the server");
+
+        let result = heartbeat(&collection, "some-task", "worker-1", "some-token").await;
+        assert!(
+            result.is_err(),
+            "expected a transient Err for an unreachable DB, got {result:?}"
+        );
+        assert_eq!(
+            classify_heartbeat_result(result),
+            HeartbeatOutcome::TransientError
+        );
     }
 }
