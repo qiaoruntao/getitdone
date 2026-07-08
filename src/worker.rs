@@ -877,7 +877,7 @@ fn task_switch_timeout(doc: &Document, fallback: Duration) -> Duration {
 /// Interval between heartbeat ticks for a running task: one-third of the
 /// switch timeout, so at least three heartbeats land before the lease expires.
 fn heartbeat_interval(worker_switch_timeout: Duration) -> TokioDuration {
-    TokioDuration::from(worker_switch_timeout / 3)
+    worker_switch_timeout / 3
 }
 
 /// Interval between periodic claim sweeps. Tasks become stealable only after
@@ -886,7 +886,7 @@ fn heartbeat_interval(worker_switch_timeout: Duration) -> TokioDuration {
 /// still reclaimed promptly.
 fn claim_sweep_interval(worker_switch_timeout: Duration) -> TokioDuration {
     let third = worker_switch_timeout / 3;
-    TokioDuration::from(third).clamp(
+    third.clamp(
         TokioDuration::from_millis(50),
         TokioDuration::from_millis(500),
     )
@@ -956,9 +956,7 @@ impl WorkerHandle {
     /// Await the worker without sending a stop signal. Useful for detecting early exits.
     pub async fn wait(mut self) -> Result<(), RequestError> {
         if let Some(handle) = self.join_handle.take() {
-            handle
-                .await
-                .unwrap_or_else(|_| Err(RequestError::WorkerGone))
+            handle.await.unwrap_or(Err(RequestError::WorkerGone))
         } else {
             Ok(())
         }
