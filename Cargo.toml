@@ -36,14 +36,22 @@ bson = { version = "3", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 
 # Optional Tracing & OpenTelemetry
+#
+# Pinned to match init-tracing-opentelemetry's (the app-side setup crate most
+# consumers use) opentelemetry/tracing-opentelemetry versions. If these drift
+# apart, Cargo resolves two separate copies of `opentelemetry` in the same
+# binary; getitdone's `opentelemetry::global::meter()`/tracer calls then land
+# in an orphaned registry that the app's actual pipeline never configures --
+# spans/logs still work (they ride on the unified `tracing` crate instead),
+# but metrics and span-linking silently become no-ops with no error anywhere.
 tracing = { version = "0", optional = true }
-opentelemetry = { version = "0.28", optional = true }
-tracing-opentelemetry = { version = "0.29", optional = true }
+opentelemetry = { version = "0.31", optional = true }
+tracing-opentelemetry = { version = "0.32", optional = true }
 
 [dev-dependencies]
-opentelemetry-otlp = { version = "=0.28.0", features = ["grpc-tonic"] }
-opentelemetry-stdout = { version = "=0.28.0" }
-opentelemetry_sdk = { version = "=0.28.0", features = ["rt-tokio", "testing"] }
+opentelemetry-otlp = { version = "=0.31.0", features = ["grpc-tonic"] }
+opentelemetry-stdout = { version = "=0.31.0" }
+opentelemetry_sdk = { version = "=0.31.0", features = ["rt-tokio", "testing"] }
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"] }
 
 [lints.rust]

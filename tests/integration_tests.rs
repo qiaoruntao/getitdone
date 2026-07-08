@@ -400,9 +400,9 @@ async fn test_metrics_emitted_when_enabled() {
         .expect("get_finished_metrics should not fail");
     let metric_names: Vec<String> = resource_metrics
         .iter()
-        .flat_map(|rm| rm.scope_metrics.iter())
-        .flat_map(|sm| sm.metrics.iter())
-        .map(|m| m.name.to_string())
+        .flat_map(|rm| rm.scope_metrics())
+        .flat_map(|sm| sm.metrics())
+        .map(|m| m.name().to_string())
         .collect();
 
     assert!(

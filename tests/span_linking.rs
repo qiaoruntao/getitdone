@@ -1,6 +1,5 @@
 #![cfg(feature = "tracing")]
 
-use futures_util::future::BoxFuture;
 use getitdone::TraceContext;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::error::OTelSdkResult;
@@ -21,12 +20,15 @@ impl CollectingExporter {
 }
 
 impl SpanExporter for CollectingExporter {
-    fn export(&mut self, batch: Vec<SpanData>) -> BoxFuture<'static, OTelSdkResult> {
+    fn export(
+        &self,
+        batch: Vec<SpanData>,
+    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
         let spans = Arc::clone(&self.spans);
-        Box::pin(async move {
+        async move {
             spans.lock().unwrap().extend(batch);
             Ok(())
-        })
+        }
     }
 }
 
