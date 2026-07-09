@@ -4,6 +4,7 @@ use mongodb::error::{CommandError, ErrorKind};
 use mongodb::{
     Client, Collection,
     bson::{Document, doc},
+    options::ClientOptions,
 };
 #[cfg(feature = "tracing")]
 use tracing::warn;
@@ -11,9 +12,16 @@ use tracing::warn;
 use crate::{config::Config, error::RequestError};
 
 pub async fn connect_collection(config: &Config) -> Result<Collection<Document>, RequestError> {
-    let client = Client::with_uri_str(&config.mongo_uri)
+    #[allow(unused_mut)]
+    let mut options = ClientOptions::parse(&config.mongo_uri)
         .await
         .map_err(|e| RequestError::Database(e.to_string()))?;
+    #[cfg(feature = "tracing")]
+    if config.enable_metrics {
+        crate::pool_metrics::install(&mut options);
+    }
+    let client =
+        Client::with_options(options).map_err(|e| RequestError::Database(e.to_string()))?;
     let database = client.database(&config.database);
     let collection = database.collection(&config.collection);
 
@@ -90,7 +98,9 @@ async fn warn_if_missing_indexes(collection: &Collection<Document>) {
             );
         }
         if !has_status_updated {
-            warn!("missing index on {{ status: 1, updated_at: 1 }}; worker steals require a scan");
+            warn!(
+                "missing index on {{ status: 1, updated_at: 1 }}; fallback stale detection may require a scan"
+            );
         }
         if !has_worker_state {
             warn!("missing index on worker_state.worker_id; shutdown is slower");

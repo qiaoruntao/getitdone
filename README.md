@@ -114,7 +114,7 @@ The builder always yields a `Result<TaskOutput, RequestError>`. `Ok` means the w
 - Each Mongo collection is bound to a single `TaskInput`/`TaskOutput` pair. Mixing payload types in the same collection will break compatibility.
 - Task payloads are stored as JSON (we expect structs that implement `Serialize`/`Deserialize`). Strings become JSON strings and results are stored as JSON numbers/objects so Mongo stays type-safe.
 - `.with_timeout` overrides how long this caller waits for a response.
-- `.with_worker_switch_timeout` controls the earliest point when another worker may steal the task if the current worker disappears (defaults to the config value). Actual pickup can happen later on the next worker sweep.
+- `.with_worker_switch_timeout` controls the earliest point when another worker may steal the task if the current worker disappears (defaults to the config value). Workers track running-task heartbeat expiry from startup scans and change-stream heartbeat updates, so dead-worker pickup does not depend on a frequent polling sweep.
 - `.with_idempotency_key` deduplicates duplicate submissions.
 - `.with_trace_context` takes a `TraceContext` so you can override the captured tracing metadata (optional).
 - `.reset_finished_tasks(true)` lets you reuse task ids that already finished (helpful for manual retries after a restart).
@@ -174,10 +174,10 @@ We separate failures by origin so callers can react appropriately:
 |  | Payload could not be deserialized (mismatched types) | `Err(RequestError::PayloadFormat { field })` – task marked failed with serialization details |
 | **Worker** | Handler returned `Ok(TaskOutput)` | `Ok(payload)` |
 |  | Handler returned domain error | `Err(RequestError::TaskFailed { reason })` – failure stored in Mongo |
-|  | Worker crashed/disconnected mid-task | `Err(RequestError::WorkerGone)` – task stays pending and becomes stealable after its configured `worker_switch_timeout`, then gets picked up on a later worker sweep |
+|  | Worker crashed/disconnected mid-task | `Err(RequestError::WorkerGone)` – task becomes stealable after its configured `worker_switch_timeout`, then can be picked up by the rare fallback detector |
 |  | No worker ever claimed the task before worker_timeout | `Err(RequestError::WorkerTimeout)` – caller can retry later or inspect task status |
 
-Workers automatically mark tasks as failed (with a shutdown reason) when they exit gracefully. If the process dies without updating state, the task is unlocked according to the per-task `worker_switch_timeout` (either the config default or the per-request override). That timeout is a lower bound, not a hard pickup deadline: another worker can continue it on the next claim sweep, which may be a bit later.
+Workers automatically mark tasks as failed (with a shutdown reason) when they exit gracefully. If the process dies without updating state, the task is unlocked according to the per-task `worker_switch_timeout` (either the config default or the per-request override). Workers keep an in-memory expiry map for running tasks and wake when a tracked heartbeat expires. A rare periodic stale-claim path remains as a safety resync, not the normal scheduler.
 
 Retries are intentionally left out of v0 because real retry policies are nuanced (backoff, jitter, partial progress). For now each claimed task runs exactly once. Use idempotency keys to avoid double work if you need to retrigger the same operation manually, and rely on `await_response(task_id)` to check the eventual outcome.
 

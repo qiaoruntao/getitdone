@@ -7,10 +7,18 @@ use opentelemetry::metrics::{Counter, Histogram};
 
 #[derive(Clone)]
 pub(crate) struct WorkerMetrics {
-    /// Duration of a single `claim_next_task` database round-trip, in milliseconds.
-    pub(crate) claim_duration_ms: Histogram<f64>,
-    /// Duration of a single heartbeat database write, in milliseconds.
-    pub(crate) heartbeat_duration_ms: Histogram<f64>,
+    /// Duration of a single worker database round-trip, in milliseconds. Always
+    /// tagged with `operation`: "claim", "heartbeat", "expiry_scan",
+    /// "change_stream_open", or "task_completion". Some operations add a second,
+    /// operation-specific tag on top of that -- `source` for "claim", `trigger`
+    /// for "expiry_scan"/"change_stream_open", `outcome` for "task_completion" --
+    /// so always filter by `operation` first when querying this metric.
+    pub(crate) db_operation_duration_ms: Histogram<f64>,
+    /// Tasks actually claimed in a single claim sweep/drain visit (recorded once
+    /// per `pump_available_tasks`/`pump_expired_tasks` call, not per individual
+    /// `claim_next_task` attempt). A value of 0 means the visit found nothing --
+    /// the direct "unnecessary query" signal -- tagged by `source`.
+    pub(crate) claim_batch_size: Histogram<u64>,
     /// Count of heartbeat outcomes, tagged by `outcome`: "alive", "superseded"
     /// (ownership lost -- the leading indicator for the double-claim class of
     /// bug), or "transient_error" (a DB/network failure, not proof of loss).
@@ -21,15 +29,17 @@ impl WorkerMetrics {
     pub(crate) fn new() -> Self {
         let meter = opentelemetry::global::meter("getitdone");
         Self {
-            claim_duration_ms: meter
-                .f64_histogram("getitdone.worker.claim.duration_ms")
+            db_operation_duration_ms: meter
+                .f64_histogram("getitdone.worker.db_operation.duration_ms")
                 .with_description(
-                    "Duration of a single claim_next_task database round-trip, in milliseconds",
+                    "Duration of a worker database round-trip, in milliseconds, tagged by operation",
                 )
                 .build(),
-            heartbeat_duration_ms: meter
-                .f64_histogram("getitdone.worker.heartbeat.duration_ms")
-                .with_description("Duration of a single heartbeat database write, in milliseconds")
+            claim_batch_size: meter
+                .u64_histogram("getitdone.worker.claim.batch_size")
+                .with_description(
+                    "Tasks claimed in a single claim sweep/drain visit, tagged by source",
+                )
                 .build(),
             heartbeat_outcome: meter
                 .u64_counter("getitdone.worker.heartbeat.outcome")

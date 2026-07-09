@@ -48,7 +48,7 @@ pub struct Config {
 
 - The caller and worker must be created from the same `Config`.
 - Each queue maps to a Mongo collection containing pending tasks plus worker state.
-- Optional knobs let us decide how long a caller waits and the earliest point when a worker may steal in-flight work (including per-task switch delays). Actual reclaim still depends on when a worker runs its next claim sweep.
+- Optional knobs let us decide how long a caller waits and the earliest point when a worker may steal in-flight work (including per-task switch delays). Pending-task pickup is change-stream driven; running-task recovery is driven by an in-memory expiry map fed by startup scans and heartbeat change events.
 - Builders can call `reset_finished_tasks(true)` if they want to reuse task ids that already finished (handy when replaying work manually after a restart).
 
 Workers rely on MongoDB change streams, so the deployment must be a replica set or sharded cluster. Standalone servers without change-stream support cause `Worker::connect` to error immediately.
@@ -65,13 +65,13 @@ Missing indexes only trigger warnings at runtime.
 
 ### Data flow
 
-1. **Worker boot** – `Worker::spawn` polls Mongo for `pending` tasks, claims them via `find_one_and_update`, and spawns each job on its own Tokio task while reporting heartbeats.
+1. **Worker boot** – `Worker::spawn` opens a MongoDB change stream, scans currently `running` tasks into a local expiry map, claims already-ready work, and spawns each job on its own Tokio task while reporting heartbeats.
 2. **Send task** – `caller::send(input)` returns a builder that lets the caller set per-request options (timeout, worker switch timeout, idempotency key, trace override). Calling `.await` on the builder inserts the task document (payload stored as JSON plus metadata such as trace/idempotency key/worker switch timeout) and then waits for change-stream notifications.
 3. **Dispatch only** – `caller::dispatch(input)` is the fire-and-forget variant that writes the document (still storing metadata for later tracing) and immediately returns the assigned `task_id` (String).
 4. **Process task** – The worker executes the user code (string length in the prototype), emits periodic heartbeats, and updates the Mongo document only if it still owns the task. Future versions may add retry loops.
 5. **Return value** – Callers awaiting inline rely on Mongo change streams (with a polling fallback) for notification. Callers that only have a `task_id` can later call `await_response(task_id)` to rehydrate the result, including failure details.
 
-Workers automatically mark their in-flight tasks as failed (with a shutdown reason) before a graceful shutdown. If a worker disappears without updating state, the per-task worker switch timeout ensures the task is unlocked and becomes stealable only after the requested delay. In practice, another worker reclaims it on a subsequent claim sweep, so the observed recovery time can be a bit later than the configured timeout.
+Workers automatically mark their in-flight tasks as failed (with a shutdown reason) before a graceful shutdown. If a worker disappears without updating state, the per-task worker switch timeout ensures the task is unlocked and becomes stealable only after the requested delay. Other workers keep local timers for running tasks using the initial scan plus heartbeat/status change-stream events, so an expired heartbeat can trigger a targeted `_id` claim without frequent collection polling. A rare periodic stale-claim sweep remains only as a safety resync.
 
 Tasks remain durable in Mongo even if no worker is running yet, so `TaskId` lookups keep working across restarts.
 
@@ -113,9 +113,9 @@ Trace propagation is automatic: `Caller::send` captures the current OpenTelemetr
 | `error_reason` | `Option<String>` | Worker-provided failure reason or payload format error. |
 
 Indexes:
-- `{ idempotency_key: 1 }` unique (per collection); serves as public task id.
-- `{ status: 1, updated_at: 1 }` to find stealable tasks.
-- `{ worker_state.worker_id: 1 }` to fetch in-flight tasks during shutdown.
+- `{ task_id: 1 }` unique (per collection); serves as public task id.
+- `{ status: 1, updated_at: 1 }` for status-oriented scans and fallback detection.
+- `{ "worker_state.worker_id": 1 }` to fetch in-flight tasks during shutdown.
 
 Responses can either live inside the same document (`task_output`) or separate collection if we need to store large payloads; for v0 we keep them together for simplicity.
 

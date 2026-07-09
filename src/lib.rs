@@ -3,6 +3,8 @@ mod config;
 mod error;
 #[cfg(feature = "tracing")]
 mod metrics;
+#[cfg(feature = "tracing")]
+mod pool_metrics;
 mod storage;
 #[cfg(feature = "tracing")]
 mod trace;

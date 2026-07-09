@@ -1,3 +1,5 @@
+mod expiry;
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -7,12 +9,12 @@ use futures_util::future::{BoxFuture, Either, FutureExt};
 type WorkerHandler<TInput, TOutput> = Arc<
     dyn Fn(WorkerJob<TInput>) -> BoxFuture<'static, Result<TOutput, RequestError>> + Send + Sync,
 >;
-use bson::{Bson, DateTime, Document, doc};
+use bson::{Bson, DateTime, Document, doc, oid::ObjectId};
 use futures_util::stream::StreamExt;
 use mongodb::Collection;
 use mongodb::change_stream::{ChangeStream, event::ChangeStreamEvent};
 use mongodb::error::{CommandError, ErrorKind};
-use mongodb::options::{FullDocumentType, ReturnDocument};
+use mongodb::options::ReturnDocument;
 #[cfg(feature = "tracing")]
 use opentelemetry::KeyValue;
 use serde::Serialize;
@@ -33,6 +35,10 @@ use crate::metrics::WorkerMetrics;
 use crate::storage::connect_collection;
 #[cfg(feature = "tracing")]
 use crate::trace::TraceContext;
+use expiry::{
+    ExpiryTracker, apply_change_event_to_expirations, refresh_running_expirations,
+    schedule_expiration_from_task,
+};
 
 // Metrics are entirely optional (Config::enable_metrics) and require the
 // `tracing` feature for the opentelemetry dependency they're built on. This
@@ -127,7 +133,6 @@ impl Worker {
             stop_rx,
             config.worker_switch_timeout,
             worker_id,
-            max_inflight,
             semaphore.clone(),
             handler,
             metrics,
@@ -149,7 +154,6 @@ async fn worker_loop<TInput, TOutput>(
     mut stop_rx: oneshot::Receiver<()>,
     worker_switch_timeout: Duration,
     worker_id: String,
-    max_inflight: usize,
     semaphore: Arc<Semaphore>,
     handler: WorkerHandler<TInput, TOutput>,
     metrics: Option<WorkerMetricsHandle>,
@@ -160,12 +164,21 @@ where
 {
     let mut join_set = JoinSet::new();
     let in_flight_ids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
-    let mut claim_ticker = time::interval(claim_sweep_interval(worker_switch_timeout));
-    claim_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    // Consume the immediate first tick so the sweep doesn't fire right after startup
-    // (startup already calls pump_available_tasks below).
-    claim_ticker.tick().await;
-    let mut change_stream = match open_change_stream(&collection).await {
+    let mut expiry_tracker = ExpiryTracker::new();
+    let mut stale_recovery_ticker = time::interval(stale_recovery_interval());
+    stale_recovery_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Consume the immediate first tick: this branch is only a rare fallback
+    // detector, not part of the normal change-stream scheduling path.
+    stale_recovery_ticker.tick().await;
+    let mut change_stream = match open_change_stream(
+        &collection,
+        #[cfg(feature = "tracing")]
+        &metrics,
+        #[cfg(feature = "tracing")]
+        "startup",
+    )
+    .await
+    {
         Ok(stream) => stream,
         Err(err) => {
             #[cfg(feature = "tracing")]
@@ -173,6 +186,16 @@ where
             return Err(err);
         }
     };
+    refresh_running_expirations(
+        &collection,
+        worker_switch_timeout,
+        &mut expiry_tracker,
+        #[cfg(feature = "tracing")]
+        &metrics,
+        #[cfg(feature = "tracing")]
+        "startup",
+    )
+    .await;
 
     pump_available_tasks(
         &collection,
@@ -183,12 +206,22 @@ where
         &mut join_set,
         &in_flight_ids,
         &metrics,
+        ClaimMode::Ready,
+        &mut expiry_tracker,
     )
     .await;
 
     loop {
         if change_stream.is_none() {
-            change_stream = match open_change_stream(&collection).await {
+            change_stream = match open_change_stream(
+                &collection,
+                #[cfg(feature = "tracing")]
+                &metrics,
+                #[cfg(feature = "tracing")]
+                "reconnect",
+            )
+            .await
+            {
                 Ok(stream) => stream,
                 Err(err) => {
                     #[cfg(feature = "tracing")]
@@ -196,6 +229,16 @@ where
                     return Err(err);
                 }
             };
+            refresh_running_expirations(
+                &collection,
+                worker_switch_timeout,
+                &mut expiry_tracker,
+                #[cfg(feature = "tracing")]
+                &metrics,
+                #[cfg(feature = "tracing")]
+                "reconnect",
+            )
+            .await;
             pump_available_tasks(
                 &collection,
                 &worker_id,
@@ -205,17 +248,49 @@ where
                 &mut join_set,
                 &in_flight_ids,
                 &metrics,
+                ClaimMode::Ready,
+                &mut expiry_tracker,
             )
             .await;
             continue;
         }
+        let expiry_delay = expiry_tracker.next_delay();
         let change_future = change_stream
             .as_mut()
             .map(|stream| Either::Left(stream.next()))
             .unwrap_or_else(|| Either::Right(futures_util::future::pending()));
         tokio::select! {
             _ = &mut stop_rx => break,
-            _ = claim_ticker.tick() => {
+            _ = async {
+                if let Some(delay) = expiry_delay {
+                    time::sleep(delay).await;
+                } else {
+                    futures_util::future::pending::<()>().await;
+                }
+            } => {
+                pump_expired_tasks(
+                    &collection,
+                    &worker_id,
+                    worker_switch_timeout,
+                    &semaphore,
+                    &handler,
+                    &mut join_set,
+                    &in_flight_ids,
+                    &metrics,
+                    &mut expiry_tracker,
+                ).await;
+            }
+            _ = stale_recovery_ticker.tick() => {
+                refresh_running_expirations(
+                    &collection,
+                    worker_switch_timeout,
+                    &mut expiry_tracker,
+                    #[cfg(feature = "tracing")]
+                    &metrics,
+                    #[cfg(feature = "tracing")]
+                    "periodic",
+                )
+                .await;
                 pump_available_tasks(
                     &collection,
                     &worker_id,
@@ -225,6 +300,8 @@ where
                     &mut join_set,
                     &in_flight_ids,
                     &metrics,
+                    ClaimMode::StaleRecovery,
+                    &mut expiry_tracker,
                 ).await;
             }
             Some(result) = join_set.join_next(), if !join_set.is_empty() => {
@@ -242,7 +319,13 @@ where
             }
             event = change_future => {
                 match event {
-                    Some(Ok(_)) => {
+                    Some(Ok(event)) => {
+                        let ready = apply_change_event_to_expirations(
+                            &event,
+                            worker_switch_timeout,
+                            &mut expiry_tracker,
+                        );
+                        if ready {
                         pump_available_tasks(
                             &collection,
                             &worker_id,
@@ -252,7 +335,10 @@ where
                             &mut join_set,
                             &in_flight_ids,
                             &metrics,
+                            ClaimMode::Ready,
+                            &mut expiry_tracker,
                         ).await;
+                        }
                     }
                     Some(Err(_e)) => {
                         #[cfg(feature = "tracing")]
@@ -302,6 +388,25 @@ fn is_change_stream_unsupported(error: &mongodb::error::Error) -> bool {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ClaimMode {
+    Ready,
+    StaleRecovery,
+}
+
+impl ClaimMode {
+    /// Metric `source` tag: which claim path a `claim_next_task`/`claim_batch_size`
+    /// observation came from. `claim_expired_task_by_id`'s calls (a different claim
+    /// path, but not represented by `ClaimMode`) use "expiry_targeted" directly.
+    #[cfg(feature = "tracing")]
+    fn metric_source(self) -> &'static str {
+        match self {
+            ClaimMode::Ready => "ready",
+            ClaimMode::StaleRecovery => "stale_recovery",
+        }
+    }
+}
+
 #[cfg_attr(
     feature = "tracing",
     tracing::instrument(skip(collection, excluded_ids))
@@ -311,71 +416,56 @@ async fn claim_next_task(
     worker_id: &str,
     worker_switch_timeout: Duration,
     excluded_ids: &[String],
+    mode: ClaimMode,
 ) -> Result<Option<Document>, RequestError> {
     let now = DateTime::now();
-    let default_switch_timeout_ms = worker_switch_timeout.as_millis() as i64;
     let excluded_bson: Vec<Bson> = excluded_ids
         .iter()
         .map(|id| Bson::String(id.clone()))
         .collect();
-    let filter = doc! {
-        "$or": [
-            {"status": "pending"},
-            {
-                "status": "running",
-                "worker_state.heartbeat_at": {"$type": "date"},
-                // A task this process is currently running must never be reclaimed
-                // via staleness, even if its heartbeat write falls behind under load:
-                // that would spawn a second concurrent handler for the same task.
-                "task_id": {"$nin": excluded_bson.clone()},
-                "$expr": {
-                    "$lte": [
-                        {
-                            "$add": [
-                                "$worker_state.heartbeat_at",
-                                {
-                                    "$ifNull": [
-                                        "$worker_switch_timeout",
-                                        {
-                                            "$ifNull": [
-                                                "$worker_state.switch_timeout_ms",
-                                                default_switch_timeout_ms,
-                                            ]
-                                        },
-                                    ]
-                                },
-                            ]
-                        },
-                        now,
-                    ]
-                },
-            },
+    let claim_token = Uuid::new_v4().to_string();
+    let claim_started_at = DateTime::now();
+    let claim_filter_attempts = match mode {
+        ClaimMode::Ready => vec![
+            doc! {"status": "pending"},
             // Immediately reclaim tasks from a previous crash of this worker. The
             // excluded_ids set prevents re-claiming tasks already running in this process.
-            {
+            doc! {
                 "status": "running",
                 "worker_state.worker_id": worker_id,
                 "task_id": {"$nin": excluded_bson},
             },
-        ]
-    };
-    let claim_token = Uuid::new_v4().to_string();
-    let update = doc! {
-        "$set": {
-            "status": "running",
-            "updated_at": DateTime::now(),
-            "worker_state": {
-                "worker_id": worker_id,
-                // Unique per claim (not per worker), so a superseded claim can be
-                // told apart from the one currently holding the task even when
-                // both share the same worker_id -- see heartbeat()/mark_task_failed().
-                "claim_token": claim_token,
-                "started_at": DateTime::now(),
-                "heartbeat_at": DateTime::now(),
-                "switch_timeout_ms": worker_switch_timeout.as_millis() as i64,
-            }
+        ],
+        ClaimMode::StaleRecovery => {
+            vec![stale_claim_filter(
+                now,
+                worker_switch_timeout,
+                excluded_bson,
+            )]
         }
     };
+    let update = claim_update(
+        worker_id,
+        &claim_token,
+        claim_started_at,
+        worker_switch_timeout,
+    );
+
+    for filter in claim_filter_attempts {
+        let task = claim_with_filter(collection, filter, update.clone()).await?;
+        if task.is_some() {
+            return Ok(task);
+        }
+    }
+
+    Ok(None)
+}
+
+async fn claim_with_filter(
+    collection: &Collection<Document>,
+    filter: Document,
+    update: Document,
+) -> Result<Option<Document>, RequestError> {
     collection
         .find_one_and_update(filter, update)
         .return_document(ReturnDocument::After)
@@ -383,8 +473,68 @@ async fn claim_next_task(
         .map_err(|e| RequestError::Database(e.to_string()))
 }
 
+fn claim_update(
+    worker_id: &str,
+    claim_token: &str,
+    claim_started_at: DateTime,
+    worker_switch_timeout: Duration,
+) -> Document {
+    doc! {
+        "$set": {
+            "status": "running",
+            "updated_at": claim_started_at,
+            "worker_state": {
+                "worker_id": worker_id,
+                // Unique per claim (not per worker), so a superseded claim can be
+                // told apart from the one currently holding the task even when
+                // both share the same worker_id -- see heartbeat()/mark_task_failed().
+                "claim_token": claim_token,
+                "started_at": claim_started_at,
+                "heartbeat_at": claim_started_at,
+                "switch_timeout_ms": worker_switch_timeout.as_millis() as i64,
+            }
+        }
+    }
+}
+
+fn stale_claim_filter(
+    now: DateTime,
+    worker_switch_timeout: Duration,
+    excluded_bson: Vec<Bson>,
+) -> Document {
+    let default_switch_timeout_ms = worker_switch_timeout.as_millis() as i64;
+    doc! {
+        "status": "running",
+        "worker_state.heartbeat_at": {"$type": "date"},
+        "task_id": {"$nin": excluded_bson},
+        "$expr": {
+            "$lte": [
+                {
+                    "$add": [
+                        "$worker_state.heartbeat_at",
+                        {
+                            "$ifNull": [
+                                "$worker_switch_timeout",
+                                {
+                                    "$ifNull": [
+                                        "$worker_state.switch_timeout_ms",
+                                        default_switch_timeout_ms,
+                                    ]
+                                },
+                            ]
+                        },
+                    ]
+                },
+                now,
+            ]
+        },
+    }
+}
+
 async fn open_change_stream(
     collection: &Collection<Document>,
+    #[cfg(feature = "tracing")] metrics: &Option<WorkerMetricsHandle>,
+    #[cfg(feature = "tracing")] trigger: &'static str,
 ) -> Result<Option<ChangeStream<ChangeStreamEvent<Document>>>, RequestError> {
     let pipeline = vec![doc! {
         "$match": {
@@ -392,17 +542,30 @@ async fn open_change_stream(
                 { "operationType": { "$in": ["insert", "replace"] } },
                 {
                     "operationType": "update",
-                    "updateDescription.updatedFields.status": "pending"
+                    "$or": [
+                        { "updateDescription.updatedFields.status": { "$exists": true } },
+                        { "updateDescription.updatedFields.worker_state": { "$exists": true } },
+                        { "updateDescription.updatedFields.worker_state.heartbeat_at": { "$exists": true } },
+                        { "updateDescription.updatedFields.worker_state.switch_timeout_ms": { "$exists": true } }
+                    ]
                 }
             ]
         }
     }];
-    match collection
-        .watch()
-        .pipeline(pipeline)
-        .full_document(FullDocumentType::UpdateLookup)
-        .await
-    {
+    #[cfg(feature = "tracing")]
+    let started_at = std::time::Instant::now();
+    let result = collection.watch().pipeline(pipeline).await;
+    #[cfg(feature = "tracing")]
+    if let Some(m) = metrics.as_ref() {
+        m.db_operation_duration_ms.record(
+            started_at.elapsed().as_secs_f64() * 1000.0,
+            &[
+                KeyValue::new("operation", "change_stream_open"),
+                KeyValue::new("trigger", trigger),
+            ],
+        );
+    }
+    match result {
         Ok(stream) => Ok(Some(stream)),
         Err(e) => {
             if is_change_stream_unsupported(&e) {
@@ -431,42 +594,75 @@ async fn pump_available_tasks<TInput, TOutput>(
     join_set: &mut JoinSet<Result<(), RequestError>>,
     in_flight_ids: &Arc<Mutex<HashSet<String>>>,
     metrics: &Option<WorkerMetricsHandle>,
+    claim_mode: ClaimMode,
+    expiry_tracker: &mut ExpiryTracker,
 ) where
     TInput: DeserializeOwned + Send + 'static,
     TOutput: Serialize + Send + Sync + 'static,
 {
+    #[cfg(feature = "tracing")]
+    let mut claimed_count: u64 = 0;
+    #[cfg(feature = "tracing")]
+    let mut attempted = false;
     loop {
         let Ok(permit) = semaphore.clone().try_acquire_owned() else {
             break;
         };
         let excluded: Vec<String> = in_flight_ids.lock().unwrap().iter().cloned().collect();
         #[cfg(feature = "tracing")]
+        {
+            attempted = true;
+        }
+        #[cfg(feature = "tracing")]
         let claim_started_at = std::time::Instant::now();
-        let claim_result =
-            claim_next_task(collection, worker_id, worker_switch_timeout, &excluded).await;
+        let claim_result = claim_next_task(
+            collection,
+            worker_id,
+            worker_switch_timeout,
+            &excluded,
+            claim_mode,
+        )
+        .await;
         #[cfg(feature = "tracing")]
         if let Some(m) = metrics.as_ref() {
-            m.claim_duration_ms
-                .record(claim_started_at.elapsed().as_secs_f64() * 1000.0, &[]);
+            m.db_operation_duration_ms.record(
+                claim_started_at.elapsed().as_secs_f64() * 1000.0,
+                &[
+                    KeyValue::new("operation", "claim"),
+                    KeyValue::new("source", claim_mode.metric_source()),
+                ],
+            );
         }
         match claim_result {
             Ok(Some(task)) => {
+                #[cfg(feature = "tracing")]
+                {
+                    claimed_count += 1;
+                }
+                schedule_expiration_from_task(&task, worker_switch_timeout, expiry_tracker);
                 let task_id = task.get_str("task_id").unwrap_or_default().to_string();
                 #[cfg(feature = "tracing")]
+                if matches!(claim_mode, ClaimMode::StaleRecovery) {
+                    error!(
+                        %worker_id,
+                        %task_id,
+                        "fallback stale claim detected abandoned running task; normal change-stream path did not complete it"
+                    );
+                }
+                #[cfg(feature = "tracing")]
                 info!(%worker_id, %task_id, "claimed task");
-                in_flight_ids.lock().unwrap().insert(task_id.clone());
-                let handler = handler.clone();
-                join_set.spawn(process_task(
-                    collection.clone(),
-                    task,
-                    worker_id.to_string(),
-                    handler,
-                    permit,
+                spawn_claimed_task(
+                    collection,
+                    worker_id,
                     worker_switch_timeout,
+                    handler,
+                    join_set,
+                    in_flight_ids,
+                    metrics,
+                    permit,
+                    task,
                     task_id,
-                    in_flight_ids.clone(),
-                    metrics.clone(),
-                ));
+                );
             }
             Ok(None) => {
                 drop(permit);
@@ -480,6 +676,172 @@ async fn pump_available_tasks<TInput, TOutput>(
             }
         }
     }
+    #[cfg(feature = "tracing")]
+    if attempted && let Some(m) = metrics.as_ref() {
+        m.claim_batch_size.record(
+            claimed_count,
+            &[KeyValue::new("source", claim_mode.metric_source())],
+        );
+    }
+}
+
+async fn pump_expired_tasks<TInput, TOutput>(
+    collection: &Collection<Document>,
+    worker_id: &str,
+    worker_switch_timeout: Duration,
+    semaphore: &Arc<Semaphore>,
+    handler: &WorkerHandler<TInput, TOutput>,
+    join_set: &mut JoinSet<Result<(), RequestError>>,
+    in_flight_ids: &Arc<Mutex<HashSet<String>>>,
+    metrics: &Option<WorkerMetricsHandle>,
+    expiry_tracker: &mut ExpiryTracker,
+) where
+    TInput: DeserializeOwned + Send + 'static,
+    TOutput: Serialize + Send + Sync + 'static,
+{
+    #[cfg(feature = "tracing")]
+    let mut claimed_count: u64 = 0;
+    #[cfg(feature = "tracing")]
+    let mut attempted = false;
+    for (id, expiring_task) in expiry_tracker.pop_due() {
+        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+            expiry_tracker.defer(id, expiring_task, TokioDuration::from_secs(1));
+            break;
+        };
+        let excluded: Vec<String> = in_flight_ids.lock().unwrap().iter().cloned().collect();
+        #[cfg(feature = "tracing")]
+        {
+            attempted = true;
+        }
+        #[cfg(feature = "tracing")]
+        let claim_started_at = std::time::Instant::now();
+        let claim_result = claim_expired_task_by_id(
+            collection,
+            id,
+            worker_id,
+            worker_switch_timeout,
+            expiring_task.task_id.as_deref(),
+            &excluded,
+        )
+        .await;
+        #[cfg(feature = "tracing")]
+        if let Some(m) = metrics.as_ref() {
+            m.db_operation_duration_ms.record(
+                claim_started_at.elapsed().as_secs_f64() * 1000.0,
+                &[
+                    KeyValue::new("operation", "claim"),
+                    KeyValue::new("source", "expiry_targeted"),
+                ],
+            );
+        }
+
+        match claim_result {
+            Ok(Some(task)) => {
+                #[cfg(feature = "tracing")]
+                {
+                    claimed_count += 1;
+                }
+                schedule_expiration_from_task(&task, worker_switch_timeout, expiry_tracker);
+                let task_id = task.get_str("task_id").unwrap_or_default().to_string();
+                #[cfg(feature = "tracing")]
+                warn!(%worker_id, %task_id, "claimed task after tracked heartbeat expiry");
+                spawn_claimed_task(
+                    collection,
+                    worker_id,
+                    worker_switch_timeout,
+                    handler,
+                    join_set,
+                    in_flight_ids,
+                    metrics,
+                    permit,
+                    task,
+                    task_id,
+                );
+            }
+            Ok(None) => {
+                // Not actually stale: a heartbeat write for this task raced with
+                // the tracker's own deadline and landed too recently for the DB's
+                // `stale_claim_filter` to match. `pop_due` already removed this
+                // entry, so without a retry it would only be rediscovered by the
+                // next full `refresh_running_expirations` sweep (rare, ~10 minutes)
+                // -- defer it instead, same as the semaphore-exhaustion case above.
+                drop(permit);
+                expiry_tracker.defer(id, expiring_task, TokioDuration::from_secs(1));
+            }
+            Err(_e) => {
+                #[cfg(feature = "tracing")]
+                error!(error=%_e, "failed to claim expired task");
+                drop(permit);
+            }
+        }
+    }
+    #[cfg(feature = "tracing")]
+    if attempted && let Some(m) = metrics.as_ref() {
+        m.claim_batch_size.record(
+            claimed_count,
+            &[KeyValue::new("source", "expiry_targeted")],
+        );
+    }
+}
+
+fn spawn_claimed_task<TInput, TOutput>(
+    collection: &Collection<Document>,
+    worker_id: &str,
+    worker_switch_timeout: Duration,
+    handler: &WorkerHandler<TInput, TOutput>,
+    join_set: &mut JoinSet<Result<(), RequestError>>,
+    in_flight_ids: &Arc<Mutex<HashSet<String>>>,
+    metrics: &Option<WorkerMetricsHandle>,
+    permit: OwnedSemaphorePermit,
+    task: Document,
+    task_id: String,
+) where
+    TInput: DeserializeOwned + Send + 'static,
+    TOutput: Serialize + Send + Sync + 'static,
+{
+    in_flight_ids.lock().unwrap().insert(task_id.clone());
+    join_set.spawn(process_task(
+        collection.clone(),
+        task,
+        worker_id.to_string(),
+        handler.clone(),
+        permit,
+        worker_switch_timeout,
+        task_id,
+        in_flight_ids.clone(),
+        metrics.clone(),
+    ));
+}
+
+async fn claim_expired_task_by_id(
+    collection: &Collection<Document>,
+    id: ObjectId,
+    worker_id: &str,
+    worker_switch_timeout: Duration,
+    task_id: Option<&str>,
+    excluded_ids: &[String],
+) -> Result<Option<Document>, RequestError> {
+    let now = DateTime::now();
+    let excluded_bson: Vec<Bson> = excluded_ids
+        .iter()
+        .map(|id| Bson::String(id.clone()))
+        .collect();
+    let mut filter = stale_claim_filter(now, worker_switch_timeout, excluded_bson);
+    filter.insert("_id", id);
+    if let Some(task_id) = task_id {
+        filter.insert("task_id", task_id);
+    }
+
+    let claim_token = Uuid::new_v4().to_string();
+    let claim_started_at = DateTime::now();
+    let update = claim_update(
+        worker_id,
+        &claim_token,
+        claim_started_at,
+        worker_switch_timeout,
+    );
+
+    claim_with_filter(collection, filter, update).await
 }
 
 #[cfg_attr(
@@ -586,6 +948,8 @@ where
                 &worker_id,
                 &claim_token,
                 &format!("infrastructure error: {err}"),
+                #[cfg(feature = "tracing")]
+                &metrics,
             )
             .await;
             return Err(err);
@@ -611,7 +975,7 @@ where
         task_switch_timeout,
         hb_stop_rx,
         lost_ownership_tx,
-        metrics,
+        metrics.clone(),
     );
 
     #[cfg(feature = "tracing")]
@@ -680,10 +1044,22 @@ where
                     "worker_state.finished_at": DateTime::now(),
                 }
             };
+            #[cfg(feature = "tracing")]
+            let completion_started_at = std::time::Instant::now();
             let result = collection
                 .update_one(filter, update)
                 .await
                 .map_err(|e| RequestError::Database(e.to_string()))?;
+            #[cfg(feature = "tracing")]
+            if let Some(m) = metrics.as_ref() {
+                m.db_operation_duration_ms.record(
+                    completion_started_at.elapsed().as_secs_f64() * 1000.0,
+                    &[
+                        KeyValue::new("operation", "task_completion"),
+                        KeyValue::new("outcome", "succeeded"),
+                    ],
+                );
+            }
             if result.matched_count == 0 {
                 #[cfg(feature = "tracing")]
                 error!(%worker_id, %task_id, "lost ownership before completing");
@@ -700,6 +1076,8 @@ where
                 &worker_id,
                 &claim_token,
                 &format!("handler error: {err}"),
+                #[cfg(feature = "tracing")]
+                &metrics,
             )
             .await;
             Err(err)
@@ -707,13 +1085,14 @@ where
     }
 }
 
-#[cfg_attr(feature = "tracing", tracing::instrument(skip(collection)))]
+#[cfg_attr(feature = "tracing", tracing::instrument(skip(collection, metrics)))]
 async fn mark_task_failed(
     collection: &Collection<Document>,
     task_id: &str,
     worker_id: &str,
     claim_token: &str,
     reason: &str,
+    #[cfg(feature = "tracing")] metrics: &Option<WorkerMetricsHandle>,
 ) {
     // Scoped to this exact claim: an already-superseded claim must never be able
     // to overwrite a task a newer claim owns, even by marking it "failed".
@@ -731,7 +1110,20 @@ async fn mark_task_failed(
             "worker_state.finished_at": DateTime::now(),
         }
     };
-    match collection.update_one(filter, update).await {
+    #[cfg(feature = "tracing")]
+    let started_at = std::time::Instant::now();
+    let write_result = collection.update_one(filter, update).await;
+    #[cfg(feature = "tracing")]
+    if let Some(m) = metrics.as_ref() {
+        m.db_operation_duration_ms.record(
+            started_at.elapsed().as_secs_f64() * 1000.0,
+            &[
+                KeyValue::new("operation", "task_completion"),
+                KeyValue::new("outcome", "failed"),
+            ],
+        );
+    }
+    match write_result {
         Ok(result) if result.matched_count == 0 => {
             // Not an error: this claim was already superseded, so the task is no
             // longer ours to fail. Whoever holds it now is responsible for it.
@@ -820,14 +1212,21 @@ fn start_heartbeat_loop(
                 _ = ticker.tick() => {
                     #[cfg(feature = "tracing")]
                     let started_at = std::time::Instant::now();
-                    let result = heartbeat(&collection, &task_id, &worker_id, &claim_token).await;
+                    let result = heartbeat(
+                        &collection,
+                        &task_id,
+                        &worker_id,
+                        &claim_token,
+                    ).await;
                     #[cfg(feature = "tracing")]
                     let err_for_log = if let Err(ref e) = result { Some(e.to_string()) } else { None };
                     let outcome = classify_heartbeat_result(result);
                     #[cfg(feature = "tracing")]
                     if let Some(m) = metrics.as_ref() {
-                        m.heartbeat_duration_ms
-                            .record(started_at.elapsed().as_secs_f64() * 1000.0, &[]);
+                        m.db_operation_duration_ms.record(
+                            started_at.elapsed().as_secs_f64() * 1000.0,
+                            &[KeyValue::new("operation", "heartbeat")],
+                        );
                         let outcome_label = match outcome {
                             HeartbeatOutcome::Alive => "alive",
                             HeartbeatOutcome::Superseded => "superseded",
@@ -880,16 +1279,10 @@ fn heartbeat_interval(worker_switch_timeout: Duration) -> TokioDuration {
     worker_switch_timeout / 3
 }
 
-/// Interval between periodic claim sweeps. Tasks become stealable only after
-/// their switch timeout, but the worker only knows its default timeout here.
-/// Keep the sweep bounded so tasks that request a shorter per-task timeout are
-/// still reclaimed promptly.
-fn claim_sweep_interval(worker_switch_timeout: Duration) -> TokioDuration {
-    let third = worker_switch_timeout / 3;
-    third.clamp(
-        TokioDuration::from_millis(50),
-        TokioDuration::from_millis(500),
-    )
+/// Rare fallback detector for abandoned running tasks. Normal task pickup is
+/// change-stream driven; this should not participate in steady-state scheduling.
+fn stale_recovery_interval() -> TokioDuration {
+    TokioDuration::from_secs(10 * 60)
 }
 
 struct InFlightGuard {
@@ -1000,6 +1393,7 @@ impl Drop for WorkerHandle {
 mod claim_tests {
     use super::*;
     use crate::config::Config;
+    use crate::worker::expiry::expiration_update_from_fields;
     use std::time::SystemTime;
 
     async fn test_collection(name_prefix: &str) -> Collection<Document> {
@@ -1051,9 +1445,15 @@ mod claim_tests {
         insert_stale_running_task(&collection, task_id, worker_id).await;
 
         let excluded = vec![task_id.to_string()];
-        let result = claim_next_task(&collection, worker_id, Duration::from_millis(50), &excluded)
-            .await
-            .expect("claim_next_task should not error");
+        let result = claim_next_task(
+            &collection,
+            worker_id,
+            Duration::from_millis(50),
+            &excluded,
+            ClaimMode::StaleRecovery,
+        )
+        .await
+        .expect("claim_next_task should not error");
 
         assert!(
             result.is_none(),
@@ -1074,13 +1474,43 @@ mod claim_tests {
         let worker_id = "worker-1";
         insert_stale_running_task(&collection, task_id, worker_id).await;
 
-        let result = claim_next_task(&collection, worker_id, Duration::from_millis(50), &[])
-            .await
-            .expect("claim_next_task should not error");
+        let result = claim_next_task(
+            &collection,
+            worker_id,
+            Duration::from_millis(50),
+            &[],
+            ClaimMode::StaleRecovery,
+        )
+        .await
+        .expect("claim_next_task should not error");
 
         assert!(
             result.is_some(),
             "worker failed to reclaim a genuinely stale, non-in-flight task"
+        );
+
+        let _ = collection.drop().await;
+    }
+
+    #[tokio::test]
+    async fn ready_mode_does_not_reclaim_abandoned_running_tasks() {
+        let collection = test_collection("ready_ignores_stale").await;
+        let worker_id = "worker-1";
+        insert_stale_running_task(&collection, "legacy-stale-task", "dead-worker").await;
+
+        let result = claim_next_task(
+            &collection,
+            worker_id,
+            Duration::from_millis(50),
+            &[],
+            ClaimMode::Ready,
+        )
+        .await
+        .expect("claim_next_task should not error");
+
+        assert!(
+            result.is_none(),
+            "change-stream ready claims must not do stale recovery work"
         );
 
         let _ = collection.drop().await;
@@ -1149,6 +1579,8 @@ mod claim_tests {
             worker_id,
             "old-superseded-token",
             "stale handler error",
+            #[cfg(feature = "tracing")]
+            &None,
         )
         .await;
 
@@ -1184,6 +1616,57 @@ mod claim_tests {
             classify_heartbeat_result(Err(RequestError::Timeout)),
             HeartbeatOutcome::TransientError
         );
+    }
+
+    #[test]
+    fn stale_recovery_interval_is_rare_fallback_detector() {
+        assert_eq!(stale_recovery_interval(), TokioDuration::from_secs(10 * 60));
+    }
+
+    #[test]
+    fn expiry_tracker_preserves_task_id_across_heartbeat_updates() {
+        let mut tracker = ExpiryTracker::new();
+        let id = ObjectId::new();
+        let first_heartbeat = DateTime::from_millis(1_000);
+        let second_heartbeat = DateTime::from_millis(2_000);
+
+        tracker.upsert(
+            id,
+            Some("task-a".to_string()),
+            first_heartbeat,
+            Duration::from_millis(50),
+        );
+        tracker.upsert(id, None, second_heartbeat, Duration::from_millis(50));
+
+        let tracked = tracker.get(&id).expect("task should be tracked");
+        assert_eq!(tracked.task_id.as_deref(), Some("task-a"));
+        assert_eq!(tracked.expires_at_ms(), 2_050);
+    }
+
+    #[test]
+    fn expiration_update_reads_whole_or_dotted_worker_state() {
+        let whole = doc! {
+            "worker_state": {
+                "heartbeat_at": DateTime::from_millis(1_000),
+                "switch_timeout_ms": 25i64,
+            }
+        };
+        let dotted = doc! {
+            "worker_state.heartbeat_at": DateTime::from_millis(2_000),
+            "worker_state.switch_timeout_ms": 50i64,
+        };
+
+        let (whole_heartbeat, whole_timeout) =
+            expiration_update_from_fields(&whole, Duration::from_millis(100))
+                .expect("whole worker_state should be parsed");
+        let (dotted_heartbeat, dotted_timeout) =
+            expiration_update_from_fields(&dotted, Duration::from_millis(100))
+                .expect("dotted worker_state should be parsed");
+
+        assert_eq!(whole_heartbeat.timestamp_millis(), 1_000);
+        assert_eq!(whole_timeout, Duration::from_millis(25));
+        assert_eq!(dotted_heartbeat.timestamp_millis(), 2_000);
+        assert_eq!(dotted_timeout, Duration::from_millis(50));
     }
 
     // A network/DB failure (e.g. a timeout reaching Mongo) must surface as an

@@ -408,20 +408,50 @@ async fn test_metrics_emitted_when_enabled() {
     assert!(
         metric_names
             .iter()
-            .any(|n| n == "getitdone.worker.claim.duration_ms"),
-        "expected claim duration metric, got: {metric_names:?}"
+            .any(|n| n == "getitdone.worker.db_operation.duration_ms"),
+        "expected db_operation duration metric, got: {metric_names:?}"
     );
     assert!(
         metric_names
             .iter()
-            .any(|n| n == "getitdone.worker.heartbeat.duration_ms"),
-        "expected heartbeat duration metric, got: {metric_names:?}"
+            .any(|n| n == "getitdone.worker.claim.batch_size"),
+        "expected claim batch_size metric, got: {metric_names:?}"
     );
     assert!(
         metric_names
             .iter()
             .any(|n| n == "getitdone.worker.heartbeat.outcome"),
         "expected heartbeat outcome metric, got: {metric_names:?}"
+    );
+
+    // `db_operation.duration_ms` is shared across operations, so also confirm
+    // both the claim and heartbeat round-trips actually recorded a point on it
+    // (not just some other operation happening to keep the metric alive).
+    let operations: std::collections::HashSet<String> = resource_metrics
+        .iter()
+        .flat_map(|rm| rm.scope_metrics())
+        .flat_map(|sm| sm.metrics())
+        .filter(|m| m.name() == "getitdone.worker.db_operation.duration_ms")
+        .filter_map(|m| match m.data() {
+            opentelemetry_sdk::metrics::data::AggregatedMetrics::F64(
+                opentelemetry_sdk::metrics::data::MetricData::Histogram(hist),
+            ) => Some(hist),
+            _ => None,
+        })
+        .flat_map(|hist| hist.data_points())
+        .filter_map(|dp| {
+            dp.attributes()
+                .find(|kv| kv.key.as_str() == "operation")
+                .map(|kv| kv.value.to_string())
+        })
+        .collect();
+    assert!(
+        operations.contains("claim"),
+        "expected a claim db_operation point, got operations: {operations:?}"
+    );
+    assert!(
+        operations.contains("heartbeat"),
+        "expected a heartbeat db_operation point, got operations: {operations:?}"
     );
 }
 

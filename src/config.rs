@@ -13,7 +13,7 @@ pub struct Config {
     /// its own in-progress tasks immediately on restart without waiting for the
     /// heartbeat timeout. Defaults to a random UUID per process if not set.
     pub worker_id: Option<String>,
-    /// Emit OpenTelemetry metrics for worker database operations (claim sweep
+    /// Emit OpenTelemetry metrics for worker database operations (claim
     /// duration, heartbeat write duration, heartbeat outcome counts). Requires
     /// the `tracing` feature and an OTel `MeterProvider` already installed as
     /// the global one (the same one used for tracing/logging); a no-op otherwise.
