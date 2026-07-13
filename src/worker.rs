@@ -36,8 +36,8 @@ use crate::storage::connect_collection;
 #[cfg(feature = "tracing")]
 use crate::trace::TraceContext;
 use expiry::{
-    ExpiryTracker, apply_change_event_to_expirations, refresh_running_expirations,
-    schedule_expiration_from_task,
+    ExpiryTracker, apply_change_event_to_expirations, refresh_pending_tasks,
+    refresh_running_expirations, schedule_expiration_from_task,
 };
 
 // Metrics are entirely optional (Config::enable_metrics) and require the
@@ -196,6 +196,15 @@ where
         "startup",
     )
     .await;
+    refresh_pending_tasks(
+        &collection,
+        &mut expiry_tracker,
+        #[cfg(feature = "tracing")]
+        &metrics,
+        #[cfg(feature = "tracing")]
+        "startup",
+    )
+    .await;
 
     pump_available_tasks(
         &collection,
@@ -232,6 +241,15 @@ where
             refresh_running_expirations(
                 &collection,
                 worker_switch_timeout,
+                &mut expiry_tracker,
+                #[cfg(feature = "tracing")]
+                &metrics,
+                #[cfg(feature = "tracing")]
+                "reconnect",
+            )
+            .await;
+            refresh_pending_tasks(
+                &collection,
                 &mut expiry_tracker,
                 #[cfg(feature = "tracing")]
                 &metrics,
@@ -291,6 +309,15 @@ where
                     "periodic",
                 )
                 .await;
+                refresh_pending_tasks(
+                    &collection,
+                    &mut expiry_tracker,
+                    #[cfg(feature = "tracing")]
+                    &metrics,
+                    #[cfg(feature = "tracing")]
+                    "periodic",
+                )
+                .await;
                 pump_available_tasks(
                     &collection,
                     &worker_id,
@@ -315,6 +342,24 @@ where
                         #[cfg(feature = "tracing")]
                         error!(error=%_e, "worker task panicked");
                     }
+                }
+                // A permit was just released. Without this, a freed permit sits
+                // idle until the next qualifying change-stream event or the
+                // 10-minute fallback tick -- even with pending tasks waiting --
+                // because none of the other branches above fire on completion.
+                if expiry_tracker.has_pending() {
+                    pump_available_tasks(
+                        &collection,
+                        &worker_id,
+                        worker_switch_timeout,
+                        &semaphore,
+                        &handler,
+                        &mut join_set,
+                        &in_flight_ids,
+                        &metrics,
+                        ClaimMode::Ready,
+                        &mut expiry_tracker,
+                    ).await;
                 }
             }
             event = change_future => {
@@ -1640,7 +1685,7 @@ mod claim_tests {
 
         let tracked = tracker.get(&id).expect("task should be tracked");
         assert_eq!(tracked.task_id.as_deref(), Some("task-a"));
-        assert_eq!(tracked.expires_at_ms(), 2_050);
+        assert_eq!(tracked.expires_at_ms(), Some(2_050));
     }
 
     #[test]

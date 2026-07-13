@@ -12,20 +12,31 @@ use tracing::warn;
 #[derive(Clone, Debug)]
 pub(super) struct ExpiringTask {
     pub(super) task_id: Option<String>,
-    expires_at_ms: i64,
+    // `None` means "tracked but never expires" -- the pending-task case. Only
+    // `Some` entries are ever placed in `ExpiryTracker::deadlines`, so `pop_due`/
+    // `next_delay` naturally skip pending entries without any extra branching.
+    expires_at_ms: Option<i64>,
 }
 
 #[cfg(test)]
 impl ExpiringTask {
-    pub(super) fn expires_at_ms(&self) -> i64 {
+    pub(super) fn expires_at_ms(&self) -> Option<i64> {
         self.expires_at_ms
     }
 }
 
+/// Tracks two unrelated task-lifecycle concerns in one place so callers don't
+/// have to thread a second cache through every claim/pump function: (1) when a
+/// `running` task's heartbeat will go stale (the original purpose -- see
+/// `deadlines`/`pop_due`/`next_delay`), and (2) whether any `pending` task
+/// currently exists (`pending_count`), so a freed worker permit knows whether
+/// it's worth immediately trying to claim one instead of waiting for the next
+/// change-stream event or the 10-minute fallback scan.
 #[derive(Debug, Default)]
 pub(super) struct ExpiryTracker {
     tasks: HashMap<ObjectId, ExpiringTask>,
     deadlines: BTreeMap<i64, HashSet<ObjectId>>,
+    pending_count: usize,
 }
 
 impl ExpiryTracker {
@@ -33,9 +44,18 @@ impl ExpiryTracker {
         Self::default()
     }
 
-    fn clear(&mut self) {
-        self.tasks.clear();
+    fn clear_running(&mut self) {
+        self.tasks.retain(|_, t| t.expires_at_ms.is_none());
         self.deadlines.clear();
+    }
+
+    fn clear_pending(&mut self) {
+        self.tasks.retain(|_, t| t.expires_at_ms.is_some());
+        self.pending_count = 0;
+    }
+
+    pub(super) fn has_pending(&self) -> bool {
+        self.pending_count > 0
     }
 
     pub(super) fn upsert(
@@ -53,18 +73,41 @@ impl ExpiryTracker {
             id,
             ExpiringTask {
                 task_id,
-                expires_at_ms,
+                expires_at_ms: Some(expires_at_ms),
             },
         );
         self.deadlines.entry(expires_at_ms).or_default().insert(id);
     }
 
+    /// Marks a task as pending (never expires). Idempotent -- calling this
+    /// for an id already tracked as pending is a no-op, so it's safe to call
+    /// from both a full resync scan and an overlapping change-stream event
+    /// without double-counting `pending_count`.
+    pub(super) fn mark_pending(&mut self, id: ObjectId) {
+        if matches!(self.tasks.get(&id), Some(t) if t.expires_at_ms.is_none()) {
+            return;
+        }
+        self.remove(&id);
+        self.tasks.insert(
+            id,
+            ExpiringTask {
+                task_id: None,
+                expires_at_ms: None,
+            },
+        );
+        self.pending_count += 1;
+    }
+
     pub(super) fn remove(&mut self, id: &ObjectId) {
         if let Some(existing) = self.tasks.remove(id) {
-            if let Some(ids) = self.deadlines.get_mut(&existing.expires_at_ms) {
+            let Some(deadline) = existing.expires_at_ms else {
+                self.pending_count -= 1;
+                return;
+            };
+            if let Some(ids) = self.deadlines.get_mut(&deadline) {
                 ids.remove(id);
                 if ids.is_empty() {
-                    self.deadlines.remove(&existing.expires_at_ms);
+                    self.deadlines.remove(&deadline);
                 }
             }
         }
@@ -102,7 +145,7 @@ impl ExpiryTracker {
         self.tasks.insert(
             id,
             ExpiringTask {
-                expires_at_ms,
+                expires_at_ms: Some(expires_at_ms),
                 ..task
             },
         );
@@ -152,7 +195,7 @@ pub(super) async fn refresh_running_expirations(
         }
     };
 
-    expiry_tracker.clear();
+    expiry_tracker.clear_running();
     while let Some(result) = cursor.next().await {
         match result {
             Ok(task) => schedule_expiration_from_task(&task, worker_switch_timeout, expiry_tracker),
@@ -170,30 +213,93 @@ pub(super) async fn refresh_running_expirations(
     record_duration();
 }
 
+/// Sibling full-resync scan to `refresh_running_expirations`, same call sites
+/// (startup, change-stream reconnect, the 10-minute fallback tick) -- see
+/// `ExpiryTracker` doc comment for why these two live on one tracker instead
+/// of two.
+pub(super) async fn refresh_pending_tasks(
+    collection: &Collection<Document>,
+    expiry_tracker: &mut ExpiryTracker,
+    #[cfg(feature = "tracing")] metrics: &Option<super::WorkerMetricsHandle>,
+    #[cfg(feature = "tracing")] trigger: &'static str,
+) {
+    #[cfg(feature = "tracing")]
+    let started_at = std::time::Instant::now();
+    #[cfg(feature = "tracing")]
+    let record_duration = || {
+        if let Some(m) = metrics.as_ref() {
+            m.db_operation_duration_ms.record(
+                started_at.elapsed().as_secs_f64() * 1000.0,
+                &[
+                    opentelemetry::KeyValue::new("operation", "pending_scan"),
+                    opentelemetry::KeyValue::new("trigger", trigger),
+                ],
+            );
+        }
+    };
+
+    let mut cursor = match collection
+        .find(doc! {"status": "pending"})
+        .projection(doc! {"_id": 1})
+        .await
+    {
+        Ok(cursor) => cursor,
+        Err(_e) => {
+            #[cfg(feature = "tracing")]
+            {
+                record_duration();
+                warn!(error=%_e, "failed to scan pending tasks");
+            }
+            return;
+        }
+    };
+
+    expiry_tracker.clear_pending();
+    while let Some(result) = cursor.next().await {
+        match result {
+            Ok(doc) => {
+                if let Ok(id) = doc.get_object_id("_id") {
+                    expiry_tracker.mark_pending(id);
+                }
+            }
+            Err(_e) => {
+                #[cfg(feature = "tracing")]
+                {
+                    record_duration();
+                    warn!(error=%_e, "failed to read pending task id");
+                }
+                return;
+            }
+        }
+    }
+    #[cfg(feature = "tracing")]
+    record_duration();
+}
+
 pub(super) fn schedule_expiration_from_task(
     task: &Document,
     worker_switch_timeout: Duration,
     expiry_tracker: &mut ExpiryTracker,
 ) {
-    if task.get_str("status").ok() != Some("running") {
-        if let Ok(id) = task.get_object_id("_id") {
-            expiry_tracker.remove(&id);
-        }
-        return;
-    }
     let Ok(id) = task.get_object_id("_id") else {
         return;
     };
-    let task_id = task.get_str("task_id").ok().map(ToOwned::to_owned);
-    let Some(heartbeat_at) = heartbeat_from_task(task) else {
-        return;
-    };
-    expiry_tracker.upsert(
-        id,
-        task_id,
-        heartbeat_at,
-        task_switch_timeout(task, worker_switch_timeout),
-    );
+    match task.get_str("status").ok() {
+        Some("running") => {
+            let task_id = task.get_str("task_id").ok().map(ToOwned::to_owned);
+            let Some(heartbeat_at) = heartbeat_from_task(task) else {
+                return;
+            };
+            expiry_tracker.upsert(
+                id,
+                task_id,
+                heartbeat_at,
+                task_switch_timeout(task, worker_switch_timeout),
+            );
+        }
+        Some("pending") => expiry_tracker.mark_pending(id),
+        _ => expiry_tracker.remove(&id),
+    }
 }
 
 fn heartbeat_from_task(task: &Document) -> Option<DateTime> {
@@ -225,12 +331,17 @@ pub(super) fn apply_change_event_to_expirations(
                 return false;
             };
             if let Some(id) = id {
-                if updated_status_is_not_running(&update.updated_fields) {
-                    expiry_tracker.remove(&id);
-                } else if let Some((heartbeat_at, timeout)) =
-                    expiration_update_from_fields(&update.updated_fields, worker_switch_timeout)
-                {
-                    expiry_tracker.upsert(id, None, heartbeat_at, timeout);
+                match update.updated_fields.get_str("status").ok() {
+                    Some("pending") => expiry_tracker.mark_pending(id),
+                    Some(status) if status != "running" => expiry_tracker.remove(&id),
+                    _ => {
+                        if let Some((heartbeat_at, timeout)) = expiration_update_from_fields(
+                            &update.updated_fields,
+                            worker_switch_timeout,
+                        ) {
+                            expiry_tracker.upsert(id, None, heartbeat_at, timeout);
+                        }
+                    }
                 }
             }
             update.updated_fields.get_str("status").ok() == Some("pending")
@@ -247,13 +358,6 @@ pub(super) fn apply_change_event_to_expirations(
         }
         _ => false,
     }
-}
-
-fn updated_status_is_not_running(updated_fields: &Document) -> bool {
-    updated_fields
-        .get_str("status")
-        .map(|status| status != "running")
-        .unwrap_or(false)
 }
 
 pub(super) fn expiration_update_from_fields(

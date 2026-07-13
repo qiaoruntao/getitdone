@@ -803,3 +803,72 @@ async fn test_worker_task_counts() {
 
     worker_handle.shutdown().await;
 }
+
+// Regression test for a gap where a freed worker permit never triggered a new
+// claim attempt. With capacity exhausted, task2's insert is still seen by the
+// change stream, but the claim attempt it triggers finds the semaphore full
+// and gives up -- task2 is left sitting as genuinely `pending` in Mongo,
+// identical to the production stall this guards against. Nothing else (not
+// the periodic fallback tick, not any further change-stream event) revisits
+// it; only completing task1 and immediately retrying the claim does. If that
+// completion-triggered claim regresses, this test hangs until the timeout
+// fires instead of observing task2 start.
+#[tokio::test]
+async fn test_completion_claims_pending_task_with_no_further_events() {
+    let config = test_config().await;
+
+    let (start_tx, mut start_rx) = tokio::sync::mpsc::channel::<String>(4);
+    let (stop_tx, stop_rx) = tokio::sync::mpsc::channel::<String>(4);
+    let stop_rx = std::sync::Arc::new(tokio::sync::Mutex::new(stop_rx));
+
+    let worker = Worker::connect(config.clone())
+        .await
+        .unwrap()
+        .with_max_inflight(1);
+
+    let worker_handle = worker.run({
+        let start_tx = start_tx.clone();
+        let stop_rx = stop_rx.clone();
+        move |job: WorkerJob<EchoInput>| {
+            let start_tx = start_tx.clone();
+            let stop_rx = stop_rx.clone();
+            async move {
+                start_tx.send(job.payload.msg.clone()).await.unwrap();
+                let stop_msg = stop_rx.lock().await.recv().await.unwrap();
+                assert_eq!(job.payload.msg, stop_msg);
+                Ok(EchoOutput { msg: "done".into() })
+            }
+        }
+    });
+
+    let caller = Caller::connect(config.clone()).await.unwrap();
+
+    caller
+        .dispatch(EchoInput {
+            msg: "task1".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(start_rx.recv().await.unwrap(), "task1");
+
+    caller
+        .dispatch(EchoInput {
+            msg: "task2".into(),
+        })
+        .await
+        .unwrap();
+    // Let the insert-driven change-stream claim attempt run and fail (semaphore
+    // full), confirming task2 is left as genuinely `pending`, not just not-yet-seen.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    stop_tx.send("task1".into()).await.unwrap();
+
+    let started = tokio::time::timeout(Duration::from_secs(3), start_rx.recv())
+        .await
+        .expect("task2 was never claimed after task1's permit freed up")
+        .unwrap();
+    assert_eq!(started, "task2");
+
+    stop_tx.send("task2".into()).await.unwrap();
+    worker_handle.shutdown().await;
+}
