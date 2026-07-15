@@ -714,6 +714,12 @@ async fn pump_available_tasks<TInput, TOutput>(
                 );
             }
             Ok(None) => {
+                if matches!(claim_mode, ClaimMode::Ready) {
+                    // No ready task exists at the point of this atomic claim,
+                    // so avoid another idle completion probe until a pending
+                    // change event or periodic existence check re-arms it.
+                    expiry_tracker.set_pending_may_exist(false);
+                }
                 drop(permit);
                 break;
             }
