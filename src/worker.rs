@@ -581,22 +581,7 @@ async fn open_change_stream(
     #[cfg(feature = "tracing")] metrics: &Option<WorkerMetricsHandle>,
     #[cfg(feature = "tracing")] trigger: &'static str,
 ) -> Result<Option<ChangeStream<ChangeStreamEvent<Document>>>, RequestError> {
-    let pipeline = vec![doc! {
-        "$match": {
-            "$or": [
-                { "operationType": { "$in": ["insert", "replace"] } },
-                {
-                    "operationType": "update",
-                    "$or": [
-                        { "updateDescription.updatedFields.status": { "$exists": true } },
-                        { "updateDescription.updatedFields.worker_state": { "$exists": true } },
-                        { "updateDescription.updatedFields.worker_state.heartbeat_at": { "$exists": true } },
-                        { "updateDescription.updatedFields.worker_state.switch_timeout_ms": { "$exists": true } }
-                    ]
-                }
-            ]
-        }
-    }];
+    let pipeline = expiry_change_stream_pipeline();
     #[cfg(feature = "tracing")]
     let started_at = std::time::Instant::now();
     let result = collection.watch().pipeline(pipeline).await;
@@ -624,6 +609,25 @@ async fn open_change_stream(
             Ok(None)
         }
     }
+}
+
+fn expiry_change_stream_pipeline() -> Vec<Document> {
+    vec![doc! {
+        "$match": {
+            "$or": [
+                { "operationType": { "$in": ["insert", "replace", "delete"] } },
+                {
+                    "operationType": "update",
+                    "$or": [
+                        { "updateDescription.updatedFields.status": { "$exists": true } },
+                        { "updateDescription.updatedFields.worker_state": { "$exists": true } },
+                        { "updateDescription.updatedFields.worker_state.heartbeat_at": { "$exists": true } },
+                        { "updateDescription.updatedFields.worker_state.switch_timeout_ms": { "$exists": true } }
+                    ]
+                }
+            ]
+        }
+    }]
 }
 
 #[cfg_attr(
@@ -804,14 +808,11 @@ async fn pump_expired_tasks<TInput, TOutput>(
                 );
             }
             Ok(None) => {
-                // Not actually stale: a heartbeat write for this task raced with
-                // the tracker's own deadline and landed too recently for the DB's
-                // `stale_claim_filter` to match. `pop_due` already removed this
-                // entry, so without a retry it would only be rediscovered by the
-                // next full `refresh_running_expirations` sweep (rare, ~10 minutes)
-                // -- defer it instead, same as the semaphore-exhaustion case above.
+                // A newer heartbeat/status change made this task ineligible after
+                // it was popped from the local tracker. Its matching change-stream
+                // event will install the newer deadline or remove the entry; do
+                // not re-query Mongo against the obsolete deadline.
                 drop(permit);
-                expiry_tracker.defer(id, expiring_task, TokioDuration::from_secs(1));
             }
             Err(_e) => {
                 #[cfg(feature = "tracing")]
@@ -1686,6 +1687,27 @@ mod claim_tests {
         let tracked = tracker.get(&id).expect("task should be tracked");
         assert_eq!(tracked.task_id.as_deref(), Some("task-a"));
         assert_eq!(tracked.expires_at_ms(), Some(2_050));
+    }
+
+    #[test]
+    fn expiry_change_stream_includes_deletes_for_tracker_cleanup() {
+        let pipeline = expiry_change_stream_pipeline();
+        let alternatives = pipeline[0]
+            .get_document("$match")
+            .expect("match stage")
+            .get_array("$or")
+            .expect("operation alternatives");
+        assert!(alternatives.iter().any(|condition| {
+            condition
+                .as_document()
+                .and_then(|condition| condition.get_document("operationType").ok())
+                .and_then(|operation| operation.get_array("$in").ok())
+                .is_some_and(|operations| {
+                    operations
+                        .iter()
+                        .any(|operation| operation.as_str() == Some("delete"))
+                })
+        }));
     }
 
     #[test]
