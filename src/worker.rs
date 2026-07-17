@@ -347,20 +347,22 @@ where
                 // idle until the next qualifying change-stream event or the
                 // 10-minute fallback tick -- even with pending tasks waiting --
                 // because none of the other branches above fire on completion.
-                if expiry_tracker.has_pending() {
-                    pump_available_tasks(
-                        &collection,
-                        &worker_id,
-                        worker_switch_timeout,
-                        &semaphore,
-                        &handler,
-                        &mut join_set,
-                        &in_flight_ids,
-                        &metrics,
-                        ClaimMode::Ready,
-                        &mut expiry_tracker,
-                    ).await;
-                }
+                // This probe must not be gated on the pending hint: a prior
+                // no-task probe can clear that hint before ready work arrives.
+                // `claim_next_task` is atomic and safely returns `None` when
+                // no ready task exists.
+                pump_available_tasks(
+                    &collection,
+                    &worker_id,
+                    worker_switch_timeout,
+                    &semaphore,
+                    &handler,
+                    &mut join_set,
+                    &in_flight_ids,
+                    &metrics,
+                    ClaimMode::Ready,
+                    &mut expiry_tracker,
+                ).await;
             }
             event = change_future => {
                 match event {
