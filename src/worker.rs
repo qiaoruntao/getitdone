@@ -614,6 +614,26 @@ async fn open_change_stream(
 }
 
 fn expiry_change_stream_pipeline() -> Vec<Document> {
+    // `updateDescription.updatedFields` is a document keyed by the *literal*
+    // updated field names. A heartbeat `$set` therefore appears as
+    // `"worker_state.heartbeat_at"`, not as a nested `worker_state` document.
+    // `$getField` is required here: ordinary dotted-path matching silently
+    // misses that key, leaving the local expiry tracker on the old deadline.
+    let dotted_update_field_exists = |field: &str| {
+        doc! {
+            "$ne": [
+                {
+                    "$type": {
+                        "$getField": {
+                            "input": "$updateDescription.updatedFields",
+                            "field": field,
+                        }
+                    }
+                },
+                "missing"
+            ]
+        }
+    };
     vec![doc! {
         "$match": {
             "$or": [
@@ -623,8 +643,8 @@ fn expiry_change_stream_pipeline() -> Vec<Document> {
                     "$or": [
                         { "updateDescription.updatedFields.status": { "$exists": true } },
                         { "updateDescription.updatedFields.worker_state": { "$exists": true } },
-                        { "updateDescription.updatedFields.worker_state.heartbeat_at": { "$exists": true } },
-                        { "updateDescription.updatedFields.worker_state.switch_timeout_ms": { "$exists": true } }
+                        { "$expr": dotted_update_field_exists("worker_state.heartbeat_at") },
+                        { "$expr": dotted_update_field_exists("worker_state.switch_timeout_ms") }
                     ]
                 }
             ]
@@ -1742,6 +1762,19 @@ mod claim_tests {
         assert_eq!(whole_timeout, Duration::from_millis(25));
         assert_eq!(dotted_heartbeat.timestamp_millis(), 2_000);
         assert_eq!(dotted_timeout, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn expiry_change_stream_pipeline_reads_dotted_heartbeat_update_key_literally() {
+        let rendered = format!("{:?}", expiry_change_stream_pipeline());
+
+        assert!(rendered.contains("$getField"));
+        assert!(rendered.contains("worker_state.heartbeat_at"));
+        assert!(rendered.contains("worker_state.switch_timeout_ms"));
+        assert!(!rendered.contains("updateDescription.updatedFields.worker_state.heartbeat_at"));
+        assert!(
+            !rendered.contains("updateDescription.updatedFields.worker_state.switch_timeout_ms")
+        );
     }
 
     // A network/DB failure (e.g. a timeout reaching Mongo) must surface as an
