@@ -46,10 +46,6 @@ impl ExpiryTracker {
         self.pending_may_exist = exists;
     }
 
-    pub(super) fn has_pending(&self) -> bool {
-        self.pending_may_exist
-    }
-
     pub(super) fn upsert(
         &mut self,
         id: ObjectId,
@@ -368,10 +364,9 @@ mod tests {
             tracker.mark_pending();
         }
 
-        assert!(tracker.has_pending());
         assert!(tracker.tasks.is_empty());
 
         tracker.set_pending_may_exist(false);
-        assert!(!tracker.has_pending());
+        assert!(tracker.tasks.is_empty());
     }
 }
