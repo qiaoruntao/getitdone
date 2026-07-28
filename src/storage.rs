@@ -25,12 +25,12 @@ pub async fn connect_collection(config: &Config) -> Result<Collection<Document>,
     let database = client.database(&config.database);
     let collection = database.collection(&config.collection);
 
-    warn_if_missing_indexes(&collection).await;
+    warn_if_missing_indexes(&collection, config.claim_sort.is_some()).await;
 
     Ok(collection)
 }
 
-async fn warn_if_missing_indexes(collection: &Collection<Document>) {
+async fn warn_if_missing_indexes(collection: &Collection<Document>, claim_sort_configured: bool) {
     let mut cursor = match collection.list_indexes().await {
         Ok(cursor) => cursor,
         Err(err) => {
@@ -51,6 +51,8 @@ async fn warn_if_missing_indexes(collection: &Collection<Document>) {
     let mut has_status_updated = false;
     #[cfg(feature = "tracing")]
     let mut has_worker_state = false;
+    #[cfg(feature = "tracing")]
+    let mut has_status_created = false;
 
     while let Some(index_result) = cursor.next().await {
         let Ok(index) = index_result else {
@@ -87,6 +89,13 @@ async fn warn_if_missing_indexes(collection: &Collection<Document>) {
             {
                 has_worker_state = true;
             }
+        } else if keys == doc! { "status": 1, "created_at": -1 }
+            || keys == doc! { "status": 1, "created_at": 1 }
+        {
+            #[cfg(feature = "tracing")]
+            {
+                has_status_created = true;
+            }
         }
     }
 
@@ -105,7 +114,16 @@ async fn warn_if_missing_indexes(collection: &Collection<Document>) {
         if !has_worker_state {
             warn!("missing index on worker_state.worker_id; shutdown is slower");
         }
+        if claim_sort_configured && !has_status_created {
+            warn!(
+                "Config.claim_sort is set but no {{ status: 1, created_at: -1/1 }} index was \
+                 found; sorted claims may require an in-memory sort at scale (db.collection.\
+                 createIndex({{ status: 1, created_at: -1 }}))"
+            );
+        }
     }
+    #[cfg(not(feature = "tracing"))]
+    let _ = claim_sort_configured;
 }
 
 #[cfg(feature = "tracing")]

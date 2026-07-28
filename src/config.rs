@@ -1,3 +1,4 @@
+use bson::Document;
 use std::time::Duration;
 
 /// Configuration shared by callers and workers.
@@ -19,6 +20,18 @@ pub struct Config {
     /// the global one (the same one used for tracing/logging); a no-op otherwise.
     /// Defaults to `false`.
     pub enable_metrics: bool,
+    /// Sort applied to the normal pending-task claim query, e.g.
+    /// `doc! {"created_at": -1}` to prefer the newest tasks first. `None`
+    /// (the default) claims whatever Mongo's scan returns first, matching
+    /// pre-existing behavior -- there is no implicit FIFO guarantee either way.
+    pub claim_sort: Option<Document>,
+    /// Sort applied when recovering tasks abandoned by a dead/crashed worker
+    /// (the rare stale-recovery fallback path, not the normal claim path).
+    /// `None` (the default) recovers whatever Mongo's scan returns first. Set
+    /// independently from `claim_sort`: a service may want newest-first for
+    /// normal claims while still recovering abandoned tasks in an arbitrary
+    /// (or oldest-first) order to avoid starving old stuck tasks.
+    pub stale_recovery_sort: Option<Document>,
 }
 
 impl Config {
@@ -37,6 +50,8 @@ pub struct ConfigBuilder {
     reset_finished_to_pending: bool,
     worker_id: Option<String>,
     enable_metrics: bool,
+    claim_sort: Option<Document>,
+    stale_recovery_sort: Option<Document>,
 }
 
 impl ConfigBuilder {
@@ -88,6 +103,21 @@ impl ConfigBuilder {
         self
     }
 
+    /// Sort applied to the normal pending-task claim query, e.g.
+    /// `doc! {"created_at": -1}` to prefer the newest tasks first. Defaults to
+    /// `None`, preserving the pre-existing unsorted claim order.
+    pub fn claim_sort(mut self, sort: impl Into<Option<Document>>) -> Self {
+        self.claim_sort = sort.into();
+        self
+    }
+
+    /// Sort applied when recovering tasks abandoned by a dead/crashed worker.
+    /// Independent of `claim_sort`; defaults to `None`.
+    pub fn stale_recovery_sort(mut self, sort: impl Into<Option<Document>>) -> Self {
+        self.stale_recovery_sort = sort.into();
+        self
+    }
+
     pub fn build(self) -> Config {
         self.finalize()
     }
@@ -105,6 +135,8 @@ impl ConfigBuilder {
             allow_reset_finished_tasks: self.reset_finished_to_pending,
             worker_id: self.worker_id,
             enable_metrics: self.enable_metrics,
+            claim_sort: self.claim_sort,
+            stale_recovery_sort: self.stale_recovery_sort,
         }
     }
 }
