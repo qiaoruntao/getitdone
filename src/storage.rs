@@ -25,12 +25,12 @@ pub async fn connect_collection(config: &Config) -> Result<Collection<Document>,
     let database = client.database(&config.database);
     let collection = database.collection(&config.collection);
 
-    warn_if_missing_indexes(&collection, config.claim_sort.is_some()).await;
+    warn_if_missing_indexes(&collection, config.claim_sort.clone()).await;
 
     Ok(collection)
 }
 
-async fn warn_if_missing_indexes(collection: &Collection<Document>, claim_sort_configured: bool) {
+async fn warn_if_missing_indexes(collection: &Collection<Document>, claim_sort: Option<Document>) {
     let mut cursor = match collection.list_indexes().await {
         Ok(cursor) => cursor,
         Err(err) => {
@@ -52,7 +52,8 @@ async fn warn_if_missing_indexes(collection: &Collection<Document>, claim_sort_c
     #[cfg(feature = "tracing")]
     let mut has_worker_state = false;
     #[cfg(feature = "tracing")]
-    let mut has_status_created = false;
+    let mut has_claim_sort_index = false;
+    let expected_claim_sort_index = expected_claim_sort_index(&claim_sort);
 
     while let Some(index_result) = cursor.next().await {
         let Ok(index) = index_result else {
@@ -89,12 +90,10 @@ async fn warn_if_missing_indexes(collection: &Collection<Document>, claim_sort_c
             {
                 has_worker_state = true;
             }
-        } else if keys == doc! { "status": 1, "created_at": -1 }
-            || keys == doc! { "status": 1, "created_at": 1 }
-        {
+        } else if Some(&keys) == expected_claim_sort_index.as_ref() {
             #[cfg(feature = "tracing")]
             {
-                has_status_created = true;
+                has_claim_sort_index = true;
             }
         }
     }
@@ -114,16 +113,18 @@ async fn warn_if_missing_indexes(collection: &Collection<Document>, claim_sort_c
         if !has_worker_state {
             warn!("missing index on worker_state.worker_id; shutdown is slower");
         }
-        if claim_sort_configured && !has_status_created {
+        if let Some(expected) = &expected_claim_sort_index
+            && !has_claim_sort_index
+        {
             warn!(
-                "Config.claim_sort is set but no {{ status: 1, created_at: -1/1 }} index was \
-                 found; sorted claims may require an in-memory sort at scale (db.collection.\
-                 createIndex({{ status: 1, created_at: -1 }}))"
+                ?expected,
+                "Config.claim_sort is set but no matching compound index was found; sorted \
+                 claims may require an in-memory sort at scale"
             );
         }
     }
     #[cfg(not(feature = "tracing"))]
-    let _ = claim_sort_configured;
+    let _ = expected_claim_sort_index;
 }
 
 #[cfg(feature = "tracing")]
@@ -132,4 +133,40 @@ fn is_namespace_not_found(error: &mongodb::error::Error) -> bool {
         error.kind.as_ref(),
         ErrorKind::Command(CommandError { code: 26, .. })
     )
+}
+
+/// The compound index that would keep a `{status: "pending"}` claim query
+/// index-covered when sorted by `sort`, e.g. `{created_at: -1}` -> `{status:
+/// 1, created_at: -1}`, or `{_id: -1}` -> `{status: 1, _id: -1}`. Adapts to
+/// whichever field the service's `claim_sort` actually names, rather than
+/// assuming a specific one.
+fn expected_claim_sort_index(sort: &Option<Document>) -> Option<Document> {
+    let sort = sort.as_ref()?;
+    let (field, direction) = sort.iter().next()?;
+    let mut expected = Document::new();
+    expected.insert("status", 1i32);
+    expected.insert(field.clone(), direction.clone());
+    Some(expected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expected_claim_sort_index_is_none_without_a_claim_sort() {
+        assert_eq!(expected_claim_sort_index(&None), None);
+    }
+
+    #[test]
+    fn expected_claim_sort_index_adapts_to_the_configured_field() {
+        assert_eq!(
+            expected_claim_sort_index(&Some(doc! {"created_at": -1})),
+            Some(doc! {"status": 1, "created_at": -1})
+        );
+        assert_eq!(
+            expected_claim_sort_index(&Some(doc! {"_id": -1})),
+            Some(doc! {"status": 1, "_id": -1})
+        );
+    }
 }
