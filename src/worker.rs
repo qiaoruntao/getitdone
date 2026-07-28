@@ -114,6 +114,8 @@ impl Worker {
             worker_id,
             max_inflight,
         } = self;
+        let claim_sort = config.claim_sort.clone();
+        let stale_recovery_sort = config.stale_recovery_sort.clone();
         let handler = Arc::new(
             move |job: WorkerJob<TInput>| -> BoxFuture<'static, Result<TOutput, RequestError>> {
                 handler(job).boxed()
@@ -136,6 +138,8 @@ impl Worker {
             semaphore.clone(),
             handler,
             metrics,
+            claim_sort,
+            stale_recovery_sort,
         ));
         WorkerHandle {
             stop_signal: Some(stop_tx),
@@ -157,6 +161,8 @@ async fn worker_loop<TInput, TOutput>(
     semaphore: Arc<Semaphore>,
     handler: WorkerHandler<TInput, TOutput>,
     metrics: Option<WorkerMetricsHandle>,
+    claim_sort: Option<Document>,
+    stale_recovery_sort: Option<Document>,
 ) -> Result<(), RequestError>
 where
     TInput: DeserializeOwned + Send + 'static,
@@ -217,6 +223,7 @@ where
         &metrics,
         ClaimMode::Ready,
         &mut expiry_tracker,
+        &claim_sort,
     )
     .await;
 
@@ -268,6 +275,7 @@ where
                 &metrics,
                 ClaimMode::Ready,
                 &mut expiry_tracker,
+                &claim_sort,
             )
             .await;
             continue;
@@ -329,6 +337,7 @@ where
                     &metrics,
                     ClaimMode::StaleRecovery,
                     &mut expiry_tracker,
+                    &stale_recovery_sort,
                 ).await;
             }
             Some(result) = join_set.join_next(), if !join_set.is_empty() => {
@@ -362,6 +371,7 @@ where
                     &metrics,
                     ClaimMode::Ready,
                     &mut expiry_tracker,
+                    &claim_sort,
                 ).await;
             }
             event = change_future => {
@@ -384,6 +394,7 @@ where
                             &metrics,
                             ClaimMode::Ready,
                             &mut expiry_tracker,
+                            &claim_sort,
                         ).await;
                         }
                     }
@@ -464,6 +475,7 @@ async fn claim_next_task(
     worker_switch_timeout: Duration,
     excluded_ids: &[String],
     mode: ClaimMode,
+    sort: Option<Document>,
 ) -> Result<Option<Document>, RequestError> {
     let now = DateTime::now();
     let excluded_bson: Vec<Bson> = excluded_ids
@@ -472,22 +484,28 @@ async fn claim_next_task(
         .collect();
     let claim_token = Uuid::new_v4().to_string();
     let claim_started_at = DateTime::now();
-    let claim_filter_attempts = match mode {
+    // `sort` only ever applies to the primary filter of the current mode
+    // (the general pending-task scan, or the stale-recovery scan) -- never to
+    // the worker's-own-crashed-task reclaim arm, which is worker-scoped and
+    // low-cardinality enough that ordering it doesn't matter.
+    let claim_filter_attempts: Vec<(Document, Option<Document>)> = match mode {
         ClaimMode::Ready => vec![
-            doc! {"status": "pending"},
+            (doc! {"status": "pending"}, sort),
             // Immediately reclaim tasks from a previous crash of this worker. The
             // excluded_ids set prevents re-claiming tasks already running in this process.
-            doc! {
-                "status": "running",
-                "worker_state.worker_id": worker_id,
-                "task_id": {"$nin": excluded_bson},
-            },
+            (
+                doc! {
+                    "status": "running",
+                    "worker_state.worker_id": worker_id,
+                    "task_id": {"$nin": excluded_bson},
+                },
+                None,
+            ),
         ],
         ClaimMode::StaleRecovery => {
-            vec![stale_claim_filter(
-                now,
-                worker_switch_timeout,
-                excluded_bson,
+            vec![(
+                stale_claim_filter(now, worker_switch_timeout, excluded_bson),
+                sort,
             )]
         }
     };
@@ -498,8 +516,8 @@ async fn claim_next_task(
         worker_switch_timeout,
     );
 
-    for filter in claim_filter_attempts {
-        let task = claim_with_filter(collection, filter, update.clone()).await?;
+    for (filter, sort) in claim_filter_attempts {
+        let task = claim_with_filter(collection, filter, update.clone(), sort).await?;
         if task.is_some() {
             return Ok(task);
         }
@@ -512,10 +530,15 @@ async fn claim_with_filter(
     collection: &Collection<Document>,
     filter: Document,
     update: Document,
+    sort: Option<Document>,
 ) -> Result<Option<Document>, RequestError> {
-    collection
+    let mut action = collection
         .find_one_and_update(filter, update)
-        .return_document(ReturnDocument::After)
+        .return_document(ReturnDocument::After);
+    if let Some(sort) = sort {
+        action = action.sort(sort);
+    }
+    action
         .await
         .map_err(|e| RequestError::Database(e.to_string()))
 }
@@ -667,6 +690,7 @@ async fn pump_available_tasks<TInput, TOutput>(
     metrics: &Option<WorkerMetricsHandle>,
     claim_mode: ClaimMode,
     expiry_tracker: &mut ExpiryTracker,
+    sort: &Option<Document>,
 ) where
     TInput: DeserializeOwned + Send + 'static,
     TOutput: Serialize + Send + Sync + 'static,
@@ -692,6 +716,7 @@ async fn pump_available_tasks<TInput, TOutput>(
             worker_switch_timeout,
             &excluded,
             claim_mode,
+            sort.clone(),
         )
         .await;
         #[cfg(feature = "tracing")]
@@ -915,7 +940,7 @@ async fn claim_expired_task_by_id(
         worker_switch_timeout,
     );
 
-    claim_with_filter(collection, filter, update).await
+    claim_with_filter(collection, filter, update, None).await
 }
 
 #[cfg_attr(
@@ -1525,6 +1550,7 @@ mod claim_tests {
             Duration::from_millis(50),
             &excluded,
             ClaimMode::StaleRecovery,
+            None,
         )
         .await
         .expect("claim_next_task should not error");
@@ -1554,6 +1580,7 @@ mod claim_tests {
             Duration::from_millis(50),
             &[],
             ClaimMode::StaleRecovery,
+            None,
         )
         .await
         .expect("claim_next_task should not error");
@@ -1578,6 +1605,7 @@ mod claim_tests {
             Duration::from_millis(50),
             &[],
             ClaimMode::Ready,
+            None,
         )
         .await
         .expect("claim_next_task should not error");
@@ -1585,6 +1613,66 @@ mod claim_tests {
         assert!(
             result.is_none(),
             "change-stream ready claims must not do stale recovery work"
+        );
+
+        let _ = collection.drop().await;
+    }
+
+    async fn insert_pending_task(
+        collection: &Collection<Document>,
+        task_id: &str,
+        created_at: DateTime,
+    ) {
+        collection
+            .insert_one(doc! {
+                "task_id": task_id,
+                "status": "pending",
+                "task_input": {},
+                "created_at": created_at,
+                "updated_at": created_at,
+            })
+            .await
+            .expect("insert pending task");
+    }
+
+    // Without a `sort`, claim order is whatever Mongo's scan returns -- callers
+    // must not assume FIFO. With a `sort` doc supplied, the claim must respect
+    // it: this pins `created_at: -1` (newest first) as the motivating case,
+    // since that's what a caller wanting to prioritize fresh work would pass.
+    #[tokio::test]
+    async fn claim_next_task_respects_supplied_sort() {
+        let collection = test_collection("claim_sort_newest_first").await;
+        let worker_id = "worker-1";
+        let oldest = DateTime::from_millis(1_000);
+        let middle = DateTime::from_millis(2_000);
+        let newest = DateTime::from_millis(3_000);
+        // Inserted out of chronological order so a passing test can't be
+        // explained by coincidental natural/insertion order.
+        insert_pending_task(&collection, "task-middle", middle).await;
+        insert_pending_task(&collection, "task-oldest", oldest).await;
+        insert_pending_task(&collection, "task-newest", newest).await;
+
+        let newest_first_sort = doc! {"created_at": -1};
+        let mut claimed_order = Vec::new();
+        for _ in 0..3 {
+            let claimed = claim_next_task(
+                &collection,
+                worker_id,
+                Duration::from_millis(50),
+                &[],
+                ClaimMode::Ready,
+                Some(newest_first_sort.clone()),
+            )
+            .await
+            .expect("claim_next_task should not error")
+            .expect("a pending task should still be claimable");
+            claimed_order.push(claimed.get_str("task_id").unwrap().to_string());
+        }
+
+        assert_eq!(
+            claimed_order,
+            vec!["task-newest", "task-middle", "task-oldest"],
+            "claim_next_task did not honor the supplied newest-first sort"
         );
 
         let _ = collection.drop().await;
