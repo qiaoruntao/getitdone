@@ -342,7 +342,12 @@ async fn test_lost_ownership_aborts_in_flight_handler() {
     collection
         .update_one(
             doc! {"task_id": &task_id},
-            doc! {"$set": {"worker_state.claim_token": "someone-else-now-owns-this"}},
+            doc! {
+                "$set": {
+                    "worker_state.worker_id": "other-worker",
+                    "worker_state.claim_token": "someone-else-now-owns-this",
+                }
+            },
         )
         .await
         .unwrap();
@@ -775,8 +780,6 @@ async fn test_worker_task_counts() {
 
     // Wait for worker to pick it up
     assert_eq!(start_rx.recv().await.unwrap(), "task1");
-    // Allow some time for the semaphore to be acquired, as it happens before the handler starts
-    tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(worker_handle.get_running_task_cnt(), 1);
 
     // --- Task 2 ---
@@ -787,7 +790,6 @@ async fn test_worker_task_counts() {
         .await
         .unwrap();
     assert_eq!(start_rx.recv().await.unwrap(), "task2");
-    tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(worker_handle.get_running_task_cnt(), 2);
 
     // --- Complete Task 1 ---
