@@ -13,6 +13,13 @@ use tracing::warn;
 pub(super) struct ExpiringTask {
     pub(super) task_id: Option<String>,
     expires_at_ms: Option<i64>,
+    // The switch timeout this deadline was computed with. Retained so a
+    // later heartbeat-only change-stream update (which carries no timeout of
+    // its own -- Mongo's change stream omits fields whose value didn't
+    // change from `updatedFields`, so a heartbeat's unchanged
+    // `switch_timeout_ms` never appears there) can keep using this task's
+    // real timeout instead of falling back to the worker's config default.
+    switch_timeout_ms: i64,
 }
 
 #[cfg(test)]
@@ -46,14 +53,24 @@ impl ExpiryTracker {
         self.pending_may_exist = exists;
     }
 
+    /// `worker_switch_timeout` of `None` means the caller has no timeout for
+    /// this specific update (e.g. a heartbeat-only change-stream event) --
+    /// the previously tracked timeout for `id` is reused instead of falling
+    /// back to a fleet-wide default, which would silently override a
+    /// per-task `worker_switch_timeout` after the task's first heartbeat.
     pub(super) fn upsert(
         &mut self,
         id: ObjectId,
         task_id: Option<String>,
         heartbeat_at: DateTime,
-        worker_switch_timeout: Duration,
+        worker_switch_timeout: Option<Duration>,
     ) {
-        let timeout_ms = i64::try_from(worker_switch_timeout.as_millis()).unwrap_or(i64::MAX);
+        let timeout_ms = worker_switch_timeout
+            .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+            .or_else(|| self.tasks.get(&id).map(|task| task.switch_timeout_ms));
+        let Some(timeout_ms) = timeout_ms else {
+            return;
+        };
         let expires_at_ms = heartbeat_at.timestamp_millis().saturating_add(timeout_ms);
         let task_id = task_id.or_else(|| self.tasks.get(&id).and_then(|task| task.task_id.clone()));
         self.remove(&id);
@@ -62,6 +79,7 @@ impl ExpiryTracker {
             ExpiringTask {
                 task_id,
                 expires_at_ms: Some(expires_at_ms),
+                switch_timeout_ms: timeout_ms,
             },
         );
         self.deadlines.entry(expires_at_ms).or_default().insert(id);
@@ -248,7 +266,7 @@ pub(super) fn schedule_expiration_from_task(
                 id,
                 task_id,
                 heartbeat_at,
-                task_switch_timeout(task, worker_switch_timeout),
+                Some(task_switch_timeout(task, worker_switch_timeout)),
             );
         }
         Some("pending") => expiry_tracker.mark_pending(),
@@ -289,10 +307,9 @@ pub(super) fn apply_change_event_to_expirations(
                     Some("pending") => expiry_tracker.mark_pending(),
                     Some(status) if status != "running" => expiry_tracker.remove(&id),
                     _ => {
-                        if let Some((heartbeat_at, timeout)) = expiration_update_from_fields(
-                            &update.updated_fields,
-                            worker_switch_timeout,
-                        ) {
+                        if let Some((heartbeat_at, timeout)) =
+                            expiration_update_from_fields(&update.updated_fields)
+                        {
                             expiry_tracker.upsert(id, None, heartbeat_at, timeout);
                         }
                     }
@@ -314,18 +331,23 @@ pub(super) fn apply_change_event_to_expirations(
     }
 }
 
+/// Returns `None` for the timeout half when this update doesn't carry
+/// `switch_timeout_ms` -- notably a heartbeat-only update, since Mongo's
+/// change stream omits fields from `updatedFields` whose value didn't
+/// actually change (heartbeat() only ever touches `heartbeat_at`). Callers
+/// must not substitute a fleet-wide default for a missing timeout here: see
+/// `ExpiryTracker::upsert`, which reuses the task's previously tracked
+/// timeout instead.
 pub(super) fn expiration_update_from_fields(
     updated_fields: &Document,
-    fallback_timeout: Duration,
-) -> Option<(DateTime, Duration)> {
+) -> Option<(DateTime, Option<Duration>)> {
     if let Ok(worker_state) = updated_fields.get_document("worker_state") {
         let heartbeat_at = worker_state.get_datetime("heartbeat_at").ok()?;
         let timeout = worker_state
             .get_i64("switch_timeout_ms")
             .ok()
             .and_then(|millis| u64::try_from(millis).ok())
-            .map(Duration::from_millis)
-            .unwrap_or(fallback_timeout);
+            .map(Duration::from_millis);
         return Some((*heartbeat_at, timeout));
     }
 
@@ -336,8 +358,7 @@ pub(super) fn expiration_update_from_fields(
         .get_i64("worker_state.switch_timeout_ms")
         .ok()
         .and_then(|millis| u64::try_from(millis).ok())
-        .map(Duration::from_millis)
-        .unwrap_or(fallback_timeout);
+        .map(Duration::from_millis);
     Some((*heartbeat_at, timeout))
 }
 
