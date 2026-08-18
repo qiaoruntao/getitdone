@@ -52,6 +52,50 @@ type WorkerMetricsHandle = ();
 
 const DEFAULT_MAX_INFLIGHT: usize = 10000;
 
+#[derive(Clone, Debug, Default)]
+struct InFlightRegistry {
+    task_ids: Arc<Mutex<HashSet<String>>>,
+}
+
+impl InFlightRegistry {
+    fn contains(&self, task_id: &str) -> bool {
+        self.task_ids
+            .lock()
+            .expect("in-flight registry poisoned")
+            .contains(task_id)
+    }
+
+    fn snapshot(&self) -> Vec<String> {
+        self.task_ids
+            .lock()
+            .expect("in-flight registry poisoned")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    fn insert(&self, task_id: String) -> bool {
+        self.task_ids
+            .lock()
+            .expect("in-flight registry poisoned")
+            .insert(task_id)
+    }
+
+    fn remove(&self, task_id: &str) {
+        self.task_ids
+            .lock()
+            .expect("in-flight registry poisoned")
+            .remove(task_id);
+    }
+
+    fn len(&self) -> usize {
+        self.task_ids
+            .lock()
+            .expect("in-flight registry poisoned")
+            .len()
+    }
+}
+
 /// Long-lived component that keeps reading the configured Mongo collection,
 /// claims pending tasks, and executes user logic for each `TaskInput`.
 #[derive(Debug)]
@@ -122,9 +166,10 @@ impl Worker {
             },
         );
         let semaphore = Arc::new(Semaphore::new(max_inflight));
+        let in_flight = InFlightRegistry::default();
         let stats = WorkerStats {
             max_inflight,
-            task_semaphore: semaphore.clone(),
+            in_flight: in_flight.clone(),
         };
         #[cfg(feature = "tracing")]
         let metrics: Option<WorkerMetricsHandle> = config.enable_metrics.then(WorkerMetrics::new);
@@ -136,6 +181,7 @@ impl Worker {
             config.worker_switch_timeout,
             worker_id,
             semaphore.clone(),
+            in_flight,
             handler,
             metrics,
             claim_sort,
@@ -151,7 +197,7 @@ impl Worker {
 
 #[cfg_attr(
     feature = "tracing",
-    tracing::instrument(skip(collection, stop_rx, semaphore, handler, metrics))
+    tracing::instrument(skip(collection, stop_rx, semaphore, in_flight, handler, metrics))
 )]
 async fn worker_loop<TInput, TOutput>(
     collection: Collection<Document>,
@@ -159,6 +205,7 @@ async fn worker_loop<TInput, TOutput>(
     worker_switch_timeout: Duration,
     worker_id: String,
     semaphore: Arc<Semaphore>,
+    in_flight: InFlightRegistry,
     handler: WorkerHandler<TInput, TOutput>,
     metrics: Option<WorkerMetricsHandle>,
     claim_sort: Option<Document>,
@@ -169,7 +216,6 @@ where
     TOutput: Serialize + Send + Sync + 'static,
 {
     let mut join_set = JoinSet::new();
-    let in_flight_ids: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let mut expiry_tracker = ExpiryTracker::new();
     let mut stale_recovery_ticker = time::interval(stale_recovery_interval());
     stale_recovery_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -219,7 +265,7 @@ where
         &semaphore,
         &handler,
         &mut join_set,
-        &in_flight_ids,
+        &in_flight,
         &metrics,
         ClaimMode::Ready,
         &mut expiry_tracker,
@@ -271,7 +317,7 @@ where
                 &semaphore,
                 &handler,
                 &mut join_set,
-                &in_flight_ids,
+                &in_flight,
                 &metrics,
                 ClaimMode::Ready,
                 &mut expiry_tracker,
@@ -301,7 +347,7 @@ where
                     &semaphore,
                     &handler,
                     &mut join_set,
-                    &in_flight_ids,
+                    &in_flight,
                     &metrics,
                     &mut expiry_tracker,
                 ).await;
@@ -333,7 +379,7 @@ where
                     &semaphore,
                     &handler,
                     &mut join_set,
-                    &in_flight_ids,
+                    &in_flight,
                     &metrics,
                     ClaimMode::StaleRecovery,
                     &mut expiry_tracker,
@@ -367,7 +413,7 @@ where
                     &semaphore,
                     &handler,
                     &mut join_set,
-                    &in_flight_ids,
+                    &in_flight,
                     &metrics,
                     ClaimMode::Ready,
                     &mut expiry_tracker,
@@ -390,7 +436,7 @@ where
                             &semaphore,
                             &handler,
                             &mut join_set,
-                            &in_flight_ids,
+                            &in_flight,
                             &metrics,
                             ClaimMode::Ready,
                             &mut expiry_tracker,
@@ -490,7 +536,13 @@ async fn claim_next_task(
     // low-cardinality enough that ordering it doesn't matter.
     let claim_filter_attempts: Vec<(Document, Option<Document>)> = match mode {
         ClaimMode::Ready => vec![
-            (doc! {"status": "pending"}, sort),
+            (
+                doc! {
+                    "status": "pending",
+                    "task_id": {"$nin": excluded_bson.clone()},
+                },
+                sort,
+            ),
             // Immediately reclaim tasks from a previous crash of this worker. The
             // excluded_ids set prevents re-claiming tasks already running in this process.
             (
@@ -677,7 +729,7 @@ fn expiry_change_stream_pipeline() -> Vec<Document> {
 
 #[cfg_attr(
     feature = "tracing",
-    tracing::instrument(skip(collection, semaphore, handler, join_set, in_flight_ids, metrics))
+    tracing::instrument(skip(collection, semaphore, handler, join_set, in_flight, metrics))
 )]
 async fn pump_available_tasks<TInput, TOutput>(
     collection: &Collection<Document>,
@@ -686,7 +738,7 @@ async fn pump_available_tasks<TInput, TOutput>(
     semaphore: &Arc<Semaphore>,
     handler: &WorkerHandler<TInput, TOutput>,
     join_set: &mut JoinSet<Result<(), RequestError>>,
-    in_flight_ids: &Arc<Mutex<HashSet<String>>>,
+    in_flight: &InFlightRegistry,
     metrics: &Option<WorkerMetricsHandle>,
     claim_mode: ClaimMode,
     expiry_tracker: &mut ExpiryTracker,
@@ -703,7 +755,7 @@ async fn pump_available_tasks<TInput, TOutput>(
         let Ok(permit) = semaphore.clone().try_acquire_owned() else {
             break;
         };
-        let excluded: Vec<String> = in_flight_ids.lock().unwrap().iter().cloned().collect();
+        let excluded = in_flight.snapshot();
         #[cfg(feature = "tracing")]
         {
             attempted = true;
@@ -753,7 +805,7 @@ async fn pump_available_tasks<TInput, TOutput>(
                     worker_switch_timeout,
                     handler,
                     join_set,
-                    in_flight_ids,
+                    in_flight,
                     metrics,
                     permit,
                     task,
@@ -794,7 +846,7 @@ async fn pump_expired_tasks<TInput, TOutput>(
     semaphore: &Arc<Semaphore>,
     handler: &WorkerHandler<TInput, TOutput>,
     join_set: &mut JoinSet<Result<(), RequestError>>,
-    in_flight_ids: &Arc<Mutex<HashSet<String>>>,
+    in_flight: &InFlightRegistry,
     metrics: &Option<WorkerMetricsHandle>,
     expiry_tracker: &mut ExpiryTracker,
 ) where
@@ -806,11 +858,28 @@ async fn pump_expired_tasks<TInput, TOutput>(
     #[cfg(feature = "tracing")]
     let mut attempted = false;
     for (id, expiring_task) in expiry_tracker.pop_due() {
+        if let Some(task_id) = expiring_task.task_id.as_deref()
+            && in_flight.contains(task_id)
+        {
+            // The local handler is still authoritative even if its tracked
+            // heartbeat deadline has elapsed. Never let lease recovery create
+            // a second handler for the same task inside this worker process.
+            // A later heartbeat change will install a fresh deadline; if the
+            // process dies, another worker's startup/stale scan can recover it.
+            #[cfg(feature = "tracing")]
+            warn!(
+                %worker_id,
+                %task_id,
+                "skipped expired task reclaim; task is still locally in flight"
+            );
+            continue;
+        }
+
         let Ok(permit) = semaphore.clone().try_acquire_owned() else {
             expiry_tracker.defer(id, expiring_task, TokioDuration::from_secs(1));
             break;
         };
-        let excluded: Vec<String> = in_flight_ids.lock().unwrap().iter().cloned().collect();
+        let excluded = in_flight.snapshot();
         #[cfg(feature = "tracing")]
         {
             attempted = true;
@@ -853,7 +922,7 @@ async fn pump_expired_tasks<TInput, TOutput>(
                     worker_switch_timeout,
                     handler,
                     join_set,
-                    in_flight_ids,
+                    in_flight,
                     metrics,
                     permit,
                     task,
@@ -876,10 +945,8 @@ async fn pump_expired_tasks<TInput, TOutput>(
     }
     #[cfg(feature = "tracing")]
     if attempted && let Some(m) = metrics.as_ref() {
-        m.claim_batch_size.record(
-            claimed_count,
-            &[KeyValue::new("source", "expiry_targeted")],
-        );
+        m.claim_batch_size
+            .record(claimed_count, &[KeyValue::new("source", "expiry_targeted")]);
     }
 }
 
@@ -889,7 +956,7 @@ fn spawn_claimed_task<TInput, TOutput>(
     worker_switch_timeout: Duration,
     handler: &WorkerHandler<TInput, TOutput>,
     join_set: &mut JoinSet<Result<(), RequestError>>,
-    in_flight_ids: &Arc<Mutex<HashSet<String>>>,
+    in_flight: &InFlightRegistry,
     metrics: &Option<WorkerMetricsHandle>,
     permit: OwnedSemaphorePermit,
     task: Document,
@@ -898,7 +965,15 @@ fn spawn_claimed_task<TInput, TOutput>(
     TInput: DeserializeOwned + Send + 'static,
     TOutput: Serialize + Send + Sync + 'static,
 {
-    in_flight_ids.lock().unwrap().insert(task_id.clone());
+    if !in_flight.insert(task_id.clone()) {
+        #[cfg(feature = "tracing")]
+        warn!(
+            %worker_id,
+            %task_id,
+            "skipped starting claimed task; task is already locally in flight"
+        );
+        return;
+    }
     join_set.spawn(process_task(
         collection.clone(),
         task,
@@ -907,7 +982,7 @@ fn spawn_claimed_task<TInput, TOutput>(
         permit,
         worker_switch_timeout,
         task_id,
-        in_flight_ids.clone(),
+        in_flight.clone(),
         metrics.clone(),
     ));
 }
@@ -920,6 +995,19 @@ async fn claim_expired_task_by_id(
     task_id: Option<&str>,
     excluded_ids: &[String],
 ) -> Result<Option<Document>, RequestError> {
+    // A task already in this worker's in-flight set must never be reclaimed,
+    // no matter how stale its heartbeat looks -- it's still being actively
+    // processed by this same process. Checked up front because the filter
+    // below can't express it: `stale_claim_filter`'s `task_id: {"$nin": ...}`
+    // exclusion is unconditionally overwritten by the exact-match `task_id`
+    // insert a few lines down, so without this early return the exclusion
+    // was silently bypassed whenever `task_id` is known (the normal case).
+    if let Some(task_id) = task_id
+        && excluded_ids.iter().any(|excluded| excluded == task_id)
+    {
+        return Ok(None);
+    }
+
     let now = DateTime::now();
     let excluded_bson: Vec<Bson> = excluded_ids
         .iter()
@@ -958,7 +1046,7 @@ async fn process_task<TInput, TOutput>(
     permit: OwnedSemaphorePermit,
     worker_switch_timeout: Duration,
     inflight_task_id: String,
-    in_flight_ids: Arc<Mutex<HashSet<String>>>,
+    in_flight: InFlightRegistry,
     metrics: Option<WorkerMetricsHandle>,
 ) -> Result<(), RequestError>
 where
@@ -968,7 +1056,7 @@ where
     let _permit = permit;
     let _in_flight_guard = InFlightGuard {
         task_id: inflight_task_id,
-        in_flight_ids,
+        in_flight,
     };
     #[cfg(feature = "tracing")]
     tracing::Span::current().record("worker_id", &worker_id);
@@ -1386,12 +1474,12 @@ fn stale_recovery_interval() -> TokioDuration {
 
 struct InFlightGuard {
     task_id: String,
-    in_flight_ids: Arc<Mutex<HashSet<String>>>,
+    in_flight: InFlightRegistry,
 }
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        self.in_flight_ids.lock().unwrap().remove(&self.task_id);
+        self.in_flight.remove(&self.task_id);
     }
 }
 
@@ -1407,14 +1495,14 @@ pub struct WorkerHandle {
 #[derive(Clone)]
 pub struct WorkerStats {
     max_inflight: usize,
-    task_semaphore: Arc<Semaphore>,
+    in_flight: InFlightRegistry,
 }
 
 impl std::fmt::Debug for WorkerStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkerStats")
             .field("max_inflight", &self.max_inflight)
-            .field("task_semaphore", &self.task_semaphore.available_permits())
+            .field("running_task_count", &self.in_flight.len())
             .finish()
     }
 }
@@ -1468,7 +1556,7 @@ impl WorkerHandle {
 impl WorkerStats {
     /// Get the current count of running tasks.
     pub fn get_running_task_cnt(&self) -> usize {
-        self.max_inflight - self.task_semaphore.available_permits()
+        self.in_flight.len()
     }
 
     /// Get the maximum number of inflight tasks.
@@ -1563,6 +1651,31 @@ mod claim_tests {
         let _ = collection.drop().await;
     }
 
+    #[tokio::test]
+    async fn ready_mode_does_not_claim_pending_task_that_is_already_in_flight() {
+        let collection = test_collection("claim_pending_in_flight").await;
+        let task_id = "in-flight-task";
+        insert_pending_task(&collection, task_id, DateTime::now()).await;
+
+        let result = claim_next_task(
+            &collection,
+            "worker-1",
+            Duration::from_millis(50),
+            &[task_id.to_string()],
+            ClaimMode::Ready,
+            None,
+        )
+        .await
+        .expect("claim_next_task should not error");
+
+        assert!(
+            result.is_none(),
+            "worker claimed a pending task it already has in flight"
+        );
+
+        let _ = collection.drop().await;
+    }
+
     // Sanity check: the same stale task, when NOT in the caller's in-flight
     // set (e.g. a genuinely abandoned task from a dead worker), must still be
     // reclaimable. This confirms the fix only narrows the in-flight case and
@@ -1584,6 +1697,86 @@ mod claim_tests {
         )
         .await
         .expect("claim_next_task should not error");
+
+        assert!(
+            result.is_some(),
+            "worker failed to reclaim a genuinely stale, non-in-flight task"
+        );
+
+        let _ = collection.drop().await;
+    }
+
+    // `claim_expired_task_by_id` (the change-stream-tracked-deadline fast
+    // path, distinct from `claim_next_task`'s general scans above) built its
+    // filter by unconditionally overwriting `task_id: {"$nin": excluded}"
+    // with an exact-match `task_id` equality, silently discarding the
+    // exclusion whenever the target task_id was known -- the normal case.
+    // Under scheduling contention a worker's own heartbeat write can fall
+    // behind enough for its local expiry tracker to consider its own
+    // in-flight task "due", and this bug let it then reclaim that task out
+    // from under itself, spawning a second concurrent handler for the same
+    // task_id that never gets cleaned up.
+    #[tokio::test]
+    async fn claim_expired_task_by_id_does_not_reclaim_own_in_flight_task() {
+        let collection = test_collection("claim_expired_self_steal").await;
+        let task_id = "in-flight-task";
+        let worker_id = "worker-1";
+        insert_stale_running_task(&collection, task_id, worker_id).await;
+        let id = collection
+            .find_one(doc! {"task_id": task_id})
+            .await
+            .expect("find_one should not error")
+            .expect("task should exist")
+            .get_object_id("_id")
+            .expect("task should have an _id");
+
+        let excluded = vec![task_id.to_string()];
+        let result = claim_expired_task_by_id(
+            &collection,
+            id,
+            worker_id,
+            Duration::from_millis(50),
+            Some(task_id),
+            &excluded,
+        )
+        .await
+        .expect("claim_expired_task_by_id should not error");
+
+        assert!(
+            result.is_none(),
+            "worker re-claimed its own in-flight task via the expiry-targeted path"
+        );
+
+        let _ = collection.drop().await;
+    }
+
+    // Sanity check mirroring `stale_heartbeat_still_reclaims_when_not_in_flight`:
+    // the fix above must only narrow the in-flight case, not break legitimate
+    // recovery of a genuinely abandoned task via this same code path.
+    #[tokio::test]
+    async fn claim_expired_task_by_id_still_reclaims_when_not_in_flight() {
+        let collection = test_collection("claim_expired_legit_steal").await;
+        let task_id = "abandoned-task";
+        let worker_id = "worker-1";
+        insert_stale_running_task(&collection, task_id, worker_id).await;
+        let id = collection
+            .find_one(doc! {"task_id": task_id})
+            .await
+            .expect("find_one should not error")
+            .expect("task should exist")
+            .get_object_id("_id")
+            .expect("task should have an _id");
+
+        let result = claim_expired_task_by_id(
+            &collection,
+            id,
+            worker_id,
+            Duration::from_millis(50),
+            Some(task_id),
+            &[],
+        )
+        .await
+        .expect("claim_expired_task_by_id should not error");
 
         assert!(
             result.is_some(),
